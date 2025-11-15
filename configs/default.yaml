@@ -1,0 +1,130 @@
+seed: 211
+paths:
+  data_dir: data/ml_coding_hackathon
+  artifacts_dir: artifacts
+  models_dir: models
+  reports_dir: artifacts/reports
+  inventory_report: artifacts/data_inventory.json
+  master_table: artifacts/master_table.parquet
+split:
+  date_column: "account_open_year"
+  train_end: "2023-06-30"
+  valid_end: "2023-09-30"
+  client_id_col: "customer_ref"
+  application_id_col: "application_id"
+target:
+  column: "default"
+  positive_label: 1
+preprocessing:
+  categorical_encoder: target
+  target_encoding:
+    smoothing: 5.0
+  advanced:
+    target_col: "default"
+    id_col: "customer_ref"
+    winsor_limits: [0.01, 0.99]
+    log_skew_threshold: 1.0
+    rare_category_threshold: 0.01
+    categorical_encoding: frequency
+    enable_woe: true
+    woe_features:
+      - loan_amount
+      - interest_rate
+      - debt_to_income_ratio
+      - credit_utilization
+    scale_numeric: false
+    keep_id: true
+merging:
+  id_col: "customer_ref"
+  application_id_col: "application_id"
+  credit_history_date_col: "statement_date"
+  dpd_thresholds: [30, 60, 90]
+feature_engineering:
+  ratios:
+    dti: ["total_debt_amount", "monthly_income"]
+    utilization: ["credit_usage_amount", "available_credit"]
+    payment_rate: ["monthly_payment", "monthly_income"]
+  numeric_aggregations:
+    monthly_payment: ["mean", "max", "std"]
+    loan_amount: ["mean", "max"]
+    credit_utilization: ["mean", "max"]
+  rolling_windows: [3, 6, 12]
+  trend_features: ["credit_utilization", "monthly_payment", "loan_amount"]
+  delinquency_markers: ["dpd_30_flag", "dpd_60_flag", "dpd_90_flag"]
+  event_markers:
+    high_utilization:
+      column: "credit_utilization"
+      threshold: 0.85
+    service_issues:
+      column: "num_customer_service_calls"
+      threshold: 3
+  behavioral_flags:
+    digital_engagement:
+      column: "num_login_sessions"
+      threshold: 8
+      operator: ">="
+    mobile_first:
+      column: "has_mobile_app"
+      threshold: 1
+      operator: "=="
+  segment_normalization:
+    monthly_income: "employment_type"
+  volatility_features: ["monthly_payment", "credit_utilization"]
+  time_since_event_cols: ["dpd_30_flag", "dpd_60_flag"]
+  active_loan_indicator: "account_status_code"
+modeling:
+  cv_folds: 2
+  logistic:
+    bins: 5
+    woe_features: []
+  lightgbm:
+    n_estimators: 1200
+    learning_rate: 0.05
+    max_depth: -1
+    subsample: 0.85
+    colsample: 0.9
+    tuning:
+      enabled: true
+      n_trials: 8
+      learning_rate: [0.02, 0.08]
+      num_leaves: [32, 128]
+  catboost:
+    iterations: 500
+    learning_rate: 0.03
+    depth: 6
+    l2_leaf_reg: 6.0
+    tuning:
+      enabled: false
+      n_trials: 6
+      depth: [4, 8]
+      learning_rate: [0.02, 0.08]
+      l2_leaf_reg: [2.0, 10.0]
+calibration:
+  enabled: true
+scorecard:
+  pdo: 50
+  base_odds: 20
+  base_score: 650
+explainability:
+  shap_max_samples: 500
+  reason_codes_top_k: 3
+  reason_codes_max_samples: 200
+drift:
+  buckets: 10
+metrics:
+  primary: "ROC_AUC"
+  cost_matrix:
+    - [0, -1]
+    - [-8, 0]
+fairness:
+  sensitive_cols: []
+  min_group_size: 50
+logging:
+  level: INFO
+environment:
+  resource_limits:
+    cpus: 4
+    memory_gb: 16
+    disk_gb: 20
+monotone:
+  features: []

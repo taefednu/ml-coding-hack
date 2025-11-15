@@ -1,0 +1,33 @@
+# Bytecode / cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments & tooling
+.venv/
+env/
+.env
+.idea/
+.vscode/
+
+# Data & artifacts
+data/ml_coding_hackathon/
+artifacts/
+catboost_info/
+models/
+mlruns/
+
+# Generated files
+*.log
+*.csv
+*.parquet
+*.pkl
+tmp_model.pkl
+
+# OS noise
+.DS_Store
+Thumbs.db
