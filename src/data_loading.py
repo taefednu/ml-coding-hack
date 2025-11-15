@@ -15,9 +15,10 @@ import warnings
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 import xml.etree.ElementTree as ET
 
+import importlib
 import numpy as np
 import pandas as pd
 from charset_normalizer import from_bytes
@@ -29,6 +30,138 @@ except ImportError:  # pragma: no cover - fallback when executed as script
 
 LOGGER = get_logger(__name__)
 SUPPORTED_SUFFIXES = {".csv", ".parquet", ".jsonl", ".json", ".xml", ".xlsx"}
+CUSTOMER_ID_CANDIDATES = [
+    "customer_ref",
+    "customer_id",
+    "customer_number",
+    "cust_id",
+    "cust_num",
+    "customer",
+]
+
+
+def _parquet_engine_available() -> bool:
+    for module in ("pyarrow", "fastparquet"):
+        try:
+            importlib.import_module(module)
+            return True
+        except ImportError:
+            continue
+    return False
+
+
+PARQUET_ENGINE_AVAILABLE = _parquet_engine_available()
+
+
+def _coerce_numeric_series(series: pd.Series) -> pd.Series:
+    if series.dtype.kind in {"i", "f"}:
+        return pd.to_numeric(series, errors="coerce")
+    cleaned = (
+        series.astype(str)
+        .str.replace(r"[^0-9.+-]", "", regex=True)
+        .replace({"": np.nan})
+    )
+    return pd.to_numeric(cleaned, errors="coerce")
+
+
+def _auto_cast_numeric(df: pd.DataFrame, exclude: Optional[List[str]] = None) -> pd.DataFrame:
+    exclude = set(exclude or [])
+    for col in df.columns:
+        if col in exclude:
+            continue
+        if df[col].dtype.kind in {"i", "f"}:
+            continue
+        sample = df[col].dropna().astype(str).head(50)
+        if sample.empty:
+            continue
+        if sample.str.contains(r"[0-9]").mean() >= 0.6:
+            df[col] = _coerce_numeric_series(df[col])
+    return df
+
+
+def _standardize_customer_id(df: pd.DataFrame, id_col: str) -> pd.DataFrame:
+    if id_col in df.columns:
+        df[id_col] = df[id_col]
+    else:
+        for candidate in CUSTOMER_ID_CANDIDATES:
+            if candidate in df.columns:
+                df[id_col] = df[candidate]
+                break
+    if id_col not in df.columns:
+        raise ValueError(f"Failed to locate customer identifier columns in dataframe columns={df.columns.tolist()}")
+    df[id_col] = df[id_col].astype(str)
+    drop_cols = [col for col in CUSTOMER_ID_CANDIDATES if col in df.columns and col != id_col]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+    return df
+
+
+def _ensure_application_date(df: pd.DataFrame, config: Dict[str, Any]) -> pd.DataFrame:
+    date_col = config.get("split", {}).get("date_column", "application_date")
+    if date_col in df.columns:
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        return df
+    if "account_open_year" in df.columns:
+        df[date_col] = pd.to_datetime(df["account_open_year"].astype(int).astype(str) + "-06-30", errors="coerce")
+        return df
+    raise ValueError(f"Unable to infer application date column {date_col}")
+
+
+def _resolve_source_path(config: Dict[str, Any], source_key: str) -> Optional[Path]:
+    sources = config.get("data_sources", {})
+    filename = sources.get(source_key)
+    if not filename:
+        return None
+    data_dir = Path(config["paths"]["data_dir"])
+    path = data_dir / filename
+    if not path.exists():
+        LOGGER.warning("Source file %s missing at %s", source_key, path)
+        return None
+    return path
+
+
+def _load_source(path: Optional[Path]) -> pd.DataFrame:
+    if path is None:
+        return pd.DataFrame()
+    try:
+        return read_dataset(path)
+    except Exception as exc:
+        LOGGER.warning("Failed to read %s: %s", path, exc)
+        return pd.DataFrame()
+
+
+def load_master_dataset(config: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    id_col = config.get("merging", {}).get("id_col", "customer_ref")
+    application = _load_source(_resolve_source_path(config, "application"))
+    if application.empty:
+        raise RuntimeError("Application dataset is required and could not be loaded")
+    application = _standardize_customer_id(application, id_col)
+    application = _ensure_application_date(application, config)
+    demographics = _load_source(_resolve_source_path(config, "demographics"))
+    if not demographics.empty:
+        demographics = _standardize_customer_id(demographics, id_col)
+        demographics = _auto_cast_numeric(demographics, exclude=[id_col])
+    loan_details = _load_source(_resolve_source_path(config, "loan_details"))
+    if not loan_details.empty:
+        loan_details = _standardize_customer_id(loan_details, id_col)
+        loan_details = _auto_cast_numeric(loan_details, exclude=[id_col])
+    financial = _load_source(_resolve_source_path(config, "financial_ratios"))
+    if not financial.empty:
+        financial = _standardize_customer_id(financial, id_col)
+        financial = _auto_cast_numeric(financial, exclude=[id_col])
+    credit_history = _load_source(_resolve_source_path(config, "credit_history"))
+    if not credit_history.empty:
+        credit_history = _standardize_customer_id(credit_history, id_col)
+        credit_history = _auto_cast_numeric(credit_history, exclude=[id_col, config.get("merging", {}).get("credit_history_date_col")])
+
+    master = application.copy()
+    if not demographics.empty:
+        master = master.merge(demographics, on=id_col, how="left", suffixes=("", "_demo"))
+    if not loan_details.empty:
+        master = master.merge(loan_details, on=id_col, how="left", suffixes=("", "_loan"))
+    if not financial.empty:
+        master = master.merge(financial, on=id_col, how="left", suffixes=("", "_fin"))
+    return master, credit_history
 
 
 def _read_bytes(path: Path, n_bytes: int = 200_000) -> bytes:
@@ -147,6 +280,8 @@ def _read_xlsx_naive(path: Path) -> pd.DataFrame:
 def _read_tabular(path: Path, encoding: str, delimiter: Optional[str], nrows: Optional[int]) -> pd.DataFrame:
     suffix = path.suffix.lower()
     if suffix == ".parquet":
+        if not PARQUET_ENGINE_AVAILABLE:
+            raise ImportError("Parquet engine not installed (pyarrow or fastparquet required)")
         return pd.read_parquet(path)
     if suffix in {".csv", ".txt"}:
         return _read_csv(path, encoding, delimiter, nrows)
@@ -226,6 +361,119 @@ def guess_date_columns(columns: Iterable[str]) -> List[str]:
     return list(dict.fromkeys(guess_columns(columns, keywords)))
 
 
+def build_credit_history_features(
+    credit_history: pd.DataFrame,
+    master_df: pd.DataFrame,
+    config: Dict[str, Any],
+) -> pd.DataFrame:
+    if credit_history is None or credit_history.empty:
+        return pd.DataFrame()
+    id_col = config.get("merging", {}).get("id_col", "customer_ref")
+    app_col = config.get("split", {}).get("application_id_col", "application_id")
+    date_col = config.get("merging", {}).get("credit_history_date_col", "statement_date")
+    obs_months = config.get("target", {}).get("observation_window_months")
+    reference_date_col = config.get("split", {}).get("date_column", "application_date")
+    keys = master_df[[app_col, id_col, reference_date_col]].copy()
+    keys = keys.rename(columns={reference_date_col: "__application_date"})
+    merged = credit_history.merge(keys, on=id_col, how="right", suffixes=("", "_app"))
+    if date_col in merged.columns:
+        merged[date_col] = pd.to_datetime(merged[date_col], errors="coerce")
+        merged = merged.dropna(subset=["__application_date"])
+        if merged[date_col].notna().any():
+            merged = merged[merged[date_col] <= merged["__application_date"]]
+            if obs_months:
+                lower = merged["__application_date"] - pd.DateOffset(months=int(obs_months))
+                merged = merged[merged[date_col] >= lower]
+            merged = merged.sort_values([app_col, date_col])
+    numeric_cols = [
+        col
+        for col in merged.select_dtypes(include=["number"]).columns
+        if col not in {app_col}
+    ]
+    agg = pd.DataFrame()
+    if numeric_cols:
+        agg = merged.groupby(app_col, dropna=False)[numeric_cols].agg(["mean", "max", "min"])
+        agg.columns = [f"{col}_{stat}_hist" for col, stat in agg.columns]
+        agg = agg.reset_index()
+    counts = merged.groupby(app_col, dropna=False).size().rename("credit_history_records").reset_index()
+    result = keys[[app_col]].drop_duplicates().copy()
+    if not agg.empty:
+        result = result.merge(agg, on=app_col, how="left")
+    result = result.merge(counts, on=app_col, how="left")
+    dpd_thresholds = config.get("merging", {}).get("dpd_thresholds", [])
+    for threshold in dpd_thresholds:
+        col = f"dpd_{threshold}_flag"
+        if col in merged.columns:
+            stats = merged.groupby(app_col, dropna=False)[col].agg(["sum", "mean", "max"]).reset_index()
+            stats = stats.rename(
+                columns={
+                    "sum": f"{col}_sum_hist",
+                    "mean": f"{col}_rate_hist",
+                    "max": f"{col}_max_hist",
+                }
+            )
+            result = result.merge(stats, on=app_col, how="left")
+    if date_col not in merged.columns or merged[date_col].isna().all():
+        return result
+    dated = merged.dropna(subset=[date_col]).copy()
+    if dated.empty:
+        return result
+    dpd_cols = [col for col in dated.columns if any(token in col.lower() for token in ("dpd", "delinq", "overdue"))]
+    payment_cols = [col for col in dated.columns if "payment" in col.lower()]
+    debt_cols = [col for col in dated.columns if "debt" in col.lower() or "balance" in col.lower()]
+    util_numerators = [col for col in dated.columns if "credit_usage" in col.lower() or "revolving_balance" in col.lower()]
+    util_denominators = [col for col in dated.columns if "limit" in col.lower() or "available_credit" in col.lower()]
+    windows = [3, 6, 12]
+    for window in windows:
+        lower = dated["__application_date"] - pd.DateOffset(months=window)
+        mask = dated[date_col] >= lower
+        window_df = dated.loc[mask].copy()
+        if window_df.empty:
+            continue
+        group = window_df.groupby(app_col, dropna=False)
+        window_features: Dict[str, pd.Series] = {}
+        window_features[f"credit_history_records_{window}m"] = group.size()
+        if dpd_cols:
+            dpd_values = pd.to_numeric(window_df[dpd_cols], errors="coerce").max(axis=1)
+            dpd_group = dpd_values.groupby(window_df[app_col])
+            window_features[f"dpd_max_{window}m"] = dpd_group.max()
+            window_features[f"dpd_mean_{window}m"] = dpd_group.mean()
+            window_features[f"num_late_payments_{window}m"] = (dpd_values > 0).groupby(window_df[app_col]).sum()
+        if util_numerators and util_denominators:
+            num = pd.to_numeric(window_df[util_numerators[0]], errors="coerce")
+            den = pd.to_numeric(window_df[util_denominators[0]], errors="coerce").replace(0, np.nan)
+            util_ratio = num / den
+            util_group = util_ratio.groupby(window_df[app_col])
+            window_features[f"utilization_avg_{window}m"] = util_group.mean()
+            window_features[f"utilization_max_{window}m"] = util_group.max()
+        if payment_cols and debt_cols:
+            pay = pd.to_numeric(window_df[payment_cols[0]], errors="coerce")
+            debt = pd.to_numeric(window_df[debt_cols[0]], errors="coerce").replace(0, np.nan)
+            ratio = pay / debt
+            window_features[f"payment_to_debt_ratio_{window}m"] = ratio.groupby(window_df[app_col]).mean()
+        if window == 6 and debt_cols:
+            balance = pd.to_numeric(window_df[debt_cols[0]], errors="coerce")
+            ordered = window_df.assign(_balance=balance).dropna(subset=["_balance"])
+            if not ordered.empty:
+                def _trend(group_df: pd.DataFrame) -> float:
+                    series = group_df.sort_values(date_col)["_balance"]
+                    if len(series) < 2:
+                        return 0.0
+                    return float(series.iloc[-1] - series.iloc[0])
+                trend = ordered.groupby(app_col, dropna=False).apply(_trend)
+                window_features["trend_balance_6m"] = trend
+        if window == 6 and payment_cols:
+            pay_series = pd.to_numeric(window_df[payment_cols[0]], errors="coerce")
+            volatility = pay_series.groupby(window_df[app_col]).std(ddof=0)
+            window_features["volatility_payments_6m"] = volatility
+        if window_features:
+            window_df_final = pd.DataFrame(window_features)
+            window_df_final.index.name = app_col
+            window_df_final = window_df_final.reset_index()
+            result = result.merge(window_df_final, on=app_col, how="left")
+    return result
+
+
 def read_dataset(path: str | Path, sample_rows: Optional[int] = None) -> pd.DataFrame:
     path = Path(path)
     encoding = detect_encoding(path)
@@ -272,6 +520,9 @@ def scan_data_dir(data_dir: str | Path) -> List[DatasetSummary]:
         if path.suffix.lower() not in SUPPORTED_SUFFIXES:
             LOGGER.debug("Skipping unsupported file: %s", path)
             continue
+        if path.suffix.lower() == ".parquet" and not PARQUET_ENGINE_AVAILABLE:
+            LOGGER.info("Skipping %s (Parquet engine not installed)", path.name)
+            continue
         try:
             summaries.append(inventory_dataset(path))
         except Exception as exc:
@@ -315,9 +566,11 @@ __all__ = [
     "DatasetSummary",
     "detect_delimiter",
     "detect_encoding",
+    "build_credit_history_features",
     "export_inventory_report",
     "guess_date_columns",
     "guess_target_columns",
+    "load_master_dataset",
     "inventory_dataset",
     "read_dataset",
     "scan_data_dir",

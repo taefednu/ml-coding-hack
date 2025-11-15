@@ -8,9 +8,11 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.base import clone
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import ParameterSampler, TimeSeriesSplit
 from sklearn.pipeline import Pipeline
+from sklearn.metrics import roc_auc_score
 
 from src.metrics import compute_metrics, report_to_dict
 from src.preprocessing import build_preprocessor
@@ -29,6 +31,51 @@ try:
 except Exception:  # pragma: no cover
     CatBoostClassifier = None
     Pool = None
+
+
+LEAK_PATTERNS = [
+    "default",
+    "default_flag",
+    "is_default",
+    "label",
+    "dpd",
+    "delinq",
+    "overdue",
+    "chargeoff",
+    "charged_off",
+    "writeoff",
+    "ground_truth",
+    "bad_flag",
+    "status_after",
+    "collection",
+    "recovery",
+]
+DATE_PATTERNS = ["date", "timestamp", "payoff_date", "report_date"]
+SERVICE_COLUMNS = {"row_id", "index", "__index_level_0__"}
+
+
+def is_safe_feature(name: str, target: str, forbidden_ids: Optional[List[str]] = None) -> bool:
+    lower = name.lower()
+    if name == target:
+        return False
+    if forbidden_ids and any(name == candidate or lower == candidate.lower() for candidate in forbidden_ids):
+        return False
+    if lower in SERVICE_COLUMNS:
+        return False
+    if lower == "y" or lower.startswith("y_") or lower.endswith("_y"):
+        return False
+    if any(pattern in lower for pattern in LEAK_PATTERNS):
+        return False
+    if any(pattern in lower for pattern in DATE_PATTERNS):
+        return False
+    return True
+
+
+def _filter_features(columns: List[str], target: str, forbidden_ids: Optional[List[str]] = None) -> List[str]:
+    safe = [col for col in columns if col != target and is_safe_feature(col, target, forbidden_ids)]
+    if not safe:
+        raise ValueError("No safe features remaining after leakage filtering")
+    return safe
 
 
 @dataclass
@@ -76,7 +123,7 @@ def split_by_time(df: pd.DataFrame, date_col: str, train_end: str, valid_end: st
     valid = df[(df[date_col] > train_end_ts) & (df[date_col] <= valid_end_ts)]
     oot = df[df[date_col] > valid_end_ts]
     if valid.empty or oot.empty:
-        LOGGER.warning(
+        LOGGER.info(
             "Configured time thresholds produced empty validation/OOT slices. Falling back to quantile split on %s",
             date_col,
         )
@@ -139,11 +186,71 @@ def _random_sampler(space: Dict[str, Tuple[float, float]], n_trials: int) -> Par
     return ParameterSampler(dist, n_iter=n_trials, random_state=42)
 
 
+def _is_metrics_suspicious(metrics: Dict[str, float], cfg: Dict[str, Any]) -> bool:
+    if not cfg:
+        return False
+    if metrics.get("roc_auc", 0.0) >= cfg.get("auc", 0.9999):
+        return True
+    if metrics.get("ks", 0.0) >= cfg.get("ks", 0.9999):
+        return True
+    if metrics.get("pr_auc", 0.0) >= cfg.get("pr_auc", 0.9999):
+        return True
+    if metrics.get("brier", 1.0) <= cfg.get("brier", 1e-4):
+        return True
+    return False
+
+
+def _shuffled_auc_pipe(
+    pipe: Pipeline,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_valid: pd.DataFrame,
+    y_valid: pd.Series,
+    sample_size: int,
+) -> float:
+    if sample_size and len(X_train) > sample_size:
+        sample = X_train.sample(sample_size, random_state=42)
+        y_sample = y_train.loc[sample.index]
+    else:
+        sample = X_train
+        y_sample = y_train
+    shuffled = y_sample.sample(frac=1.0, random_state=42)
+    sanity_pipe = clone(pipe)
+    sanity_pipe.fit(sample, shuffled)
+    preds = sanity_pipe.predict_proba(X_valid)[:, 1]
+    return float(roc_auc_score(y_valid, preds))
+
+
+def _shuffled_auc_catboost(
+    clf: CatBoostClassifier,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_valid: pd.DataFrame,
+    y_valid: pd.Series,
+    categorical: List[str],
+    sample_size: int,
+) -> float:
+    if sample_size and len(X_train) > sample_size:
+        sample = X_train.sample(sample_size, random_state=42)
+        y_sample = y_train.loc[sample.index]
+    else:
+        sample = X_train
+        y_sample = y_train
+    shuffled = y_sample.sample(frac=1.0, random_state=42)
+    sanity_clf = clf.copy()
+    pool_train = Pool(sample, label=shuffled, cat_features=categorical) if categorical else Pool(sample, label=shuffled)
+    pool_valid = Pool(X_valid, label=y_valid, cat_features=categorical) if categorical else Pool(X_valid, label=y_valid)
+    sanity_clf.fit(pool_train, eval_set=pool_valid, use_best_model=False, verbose=False)
+    preds = sanity_clf.predict_proba(X_valid)[:, 1]
+    return float(roc_auc_score(y_valid, preds))
+
+
 def train_logistic_woe(train: pd.DataFrame, valid: pd.DataFrame, target: str, cfg: Dict[str, Any]) -> TrainedModel:
     feature_cols = [col for col in train.columns if col != target]
     numeric_cols = [col for col in feature_cols if train[col].dtype.kind in {"i", "f"}]
     woe_cols = cfg.get("woe_features") or numeric_cols
     woe_cols = [col for col in woe_cols if col in numeric_cols]
+    woe_cols = _filter_features(woe_cols, target)
     woe = WOETransformer(bins=cfg.get("bins", 5))
     X_train = train[woe_cols]
     y_train = train[target]
@@ -155,7 +262,7 @@ def train_logistic_woe(train: pd.DataFrame, valid: pd.DataFrame, target: str, cf
     lr = LogisticRegression(max_iter=500, class_weight="balanced")
     lr.fit(woe.transform(X_train), y_train)
     if X_valid.empty:
-        LOGGER.warning("Validation slice is empty; metrics will be computed on training set")
+        LOGGER.info("Validation slice is empty; metrics will be computed on training set")
         valid_data = woe.transform(X_train)
         valid_target = y_train
     else:
@@ -183,9 +290,9 @@ def train_lgbm(
     cv_folds: int,
 ) -> Optional[TrainedModel]:
     if LGBMClassifier is None:
-        LOGGER.warning("LightGBM not available, skipping")
+        LOGGER.info("LightGBM not available, skipping")
         return None
-    feature_cols = [col for col in train.columns if col != target]
+    feature_cols = _filter_features([col for col in train.columns if col != target], target)
     preprocessor = build_preprocessor(train[feature_cols], cfg.get("preprocessing", {}), target)
     clf = LGBMClassifier(
         n_estimators=cfg.get("n_estimators", 800),
@@ -195,6 +302,7 @@ def train_lgbm(
         colsample_bytree=cfg.get("colsample", 0.8),
         class_weight="balanced",
         n_jobs=-1,
+        verbosity=-1,
     )
     pipe = Pipeline([("prep", preprocessor), ("model", clf)])
     X_train = train[feature_cols].copy()
@@ -226,12 +334,27 @@ def train_lgbm(
     pipe.fit(X_train, y_train)
     preds = pipe.predict_proba(X_valid)[:, 1]
     metrics = report_to_dict(compute_metrics(y_valid.values, preds))
+    suspicious_cfg = cfg.get("suspicious", {})
+    is_suspicious = _is_metrics_suspicious(metrics, suspicious_cfg)
+    sanity_cfg = cfg.get("sanity_check", {})
+    if not is_suspicious and sanity_cfg.get("enabled", True):
+        sample_size = int(sanity_cfg.get("sample_size", min(len(X_train), 20000)))
+        try:
+            shuffled_auc = _shuffled_auc_pipe(pipe, X_train, y_train, X_valid, y_valid, sample_size)
+            metrics["sanity_shuffled_auc"] = shuffled_auc
+            if shuffled_auc >= sanity_cfg.get("auc_threshold", 0.6):
+                LOGGER.warning("LightGBM shuffled-target AUC %.4f indicates potential leakage", shuffled_auc)
+                is_suspicious = True
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            LOGGER.warning("LightGBM sanity check failed: %s", exc)
+    metrics["is_suspicious"] = bool(is_suspicious)
 
     if cv_folds > 1:
         cv_scores = []
         for fold, (cv_train, cv_valid) in enumerate(_cv_splits(train, target, date_col, group_col, cv_folds), start=1):
-            pipe.fit(cv_train[feature_cols], cv_train[target])
-            fold_pred = pipe.predict_proba(cv_valid[feature_cols])[:, 1]
+            cv_pipe = clone(pipe)
+            cv_pipe.fit(cv_train[feature_cols], cv_train[target])
+            fold_pred = cv_pipe.predict_proba(cv_valid[feature_cols])[:, 1]
             fold_auc = report_to_dict(compute_metrics(cv_valid[target].values, fold_pred))["roc_auc"]
             cv_scores.append({"fold": fold, "roc_auc": fold_auc})
         if cv_scores:
@@ -242,7 +365,7 @@ def train_lgbm(
         estimator=pipe,
         metrics=metrics,
         feature_cols=feature_cols,
-        extras={},
+        extras={"is_suspicious": bool(is_suspicious)},
     )
 
 
@@ -256,9 +379,9 @@ def train_catboost(
     cv_folds: int,
 ) -> Optional[TrainedModel]:
     if CatBoostClassifier is None:
-        LOGGER.warning("CatBoost not available, skipping")
+        LOGGER.info("CatBoost not available, skipping")
         return None
-    feature_cols = [col for col in train.columns if col != target]
+    feature_cols = _filter_features([col for col in train.columns if col != target], target)
     categorical = [col for col in feature_cols if train[col].dtype == "object"]
     clf = CatBoostClassifier(
         iterations=cfg.get("iterations", 2000),
@@ -320,14 +443,29 @@ def train_catboost(
     clf.fit(X_train, y_train, eval_set=(X_valid, y_valid), cat_features=categorical, use_best_model=True)
     preds = clf.predict_proba(X_valid)[:, 1]
     metrics = report_to_dict(compute_metrics(y_valid.values, preds))
+    suspicious_cfg = cfg.get("suspicious", {})
+    is_suspicious = _is_metrics_suspicious(metrics, suspicious_cfg)
+    sanity_cfg = cfg.get("sanity_check", {})
+    if not is_suspicious and sanity_cfg.get("enabled", True):
+        sample_size = int(sanity_cfg.get("sample_size", min(len(X_train), 20000)))
+        try:
+            shuffled_auc = _shuffled_auc_catboost(clf, X_train, y_train, X_valid, y_valid, categorical, sample_size)
+            metrics["sanity_shuffled_auc"] = shuffled_auc
+            if shuffled_auc >= sanity_cfg.get("auc_threshold", 0.6):
+                LOGGER.warning("CatBoost shuffled-target AUC %.4f indicates potential leakage", shuffled_auc)
+                is_suspicious = True
+        except Exception as exc:  # pragma: no cover
+            LOGGER.warning("CatBoost sanity check failed: %s", exc)
+    metrics["is_suspicious"] = bool(is_suspicious)
 
     if cv_folds > 1:
         cv_scores = []
         for fold, (cv_train, cv_valid) in enumerate(_cv_splits(train, target, date_col, group_col, cv_folds), start=1):
+            fold_clf = clf.copy()
             pool_train = Pool(cv_train[feature_cols], label=cv_train[target], cat_features=categorical)
             pool_valid = Pool(cv_valid[feature_cols], label=cv_valid[target], cat_features=categorical)
-            clf.fit(pool_train, eval_set=pool_valid, use_best_model=False)
-            fold_pred = clf.predict_proba(cv_valid[feature_cols])[:, 1]
+            fold_clf.fit(pool_train, eval_set=pool_valid, use_best_model=False)
+            fold_pred = fold_clf.predict_proba(cv_valid[feature_cols])[:, 1]
             fold_auc = report_to_dict(compute_metrics(cv_valid[target].values, fold_pred))["roc_auc"]
             cv_scores.append({"fold": fold, "roc_auc": fold_auc})
         if cv_scores:
@@ -338,12 +476,16 @@ def train_catboost(
         estimator=clf,
         metrics=metrics,
         feature_cols=feature_cols,
-        extras={"categorical": categorical},
+        extras={"categorical": categorical, "is_suspicious": bool(is_suspicious)},
     )
 
 
 __all__ = [
     "TrainedModel",
+    "LEAK_PATTERNS",
+    "ID_PATTERNS",
+    "DATE_PATTERNS",
+    "is_safe_feature",
     "split_by_time",
     "train_catboost",
     "train_lgbm",

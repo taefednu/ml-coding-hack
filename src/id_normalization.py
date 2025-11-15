@@ -21,7 +21,7 @@ DEFAULT_ID_ALIASES: Dict[str, List[str]] = {
     "demographics": ["customer_ref", "cust_id", "customer_id", "client_ref"],
     "loan_details": ["customer_ref", "customer_id", "cust_ref", "client_id"],
     "financial_ratios": ["cust_num", "customer_ref", "customer_id", "client_id"],
-    "credit_history": ["customer_ref", "customer_id", "cust_id", "client_ref"],
+    "credit_history": ["customer_ref", "customer_id", "cust_id", "client_ref", "customer_number"],
 }
 
 

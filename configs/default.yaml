@@ -6,17 +6,25 @@ paths:
   reports_dir: artifacts/reports
   inventory_report: artifacts/data_inventory.json
   master_table: artifacts/master_table.parquet
+data_sources:
+  application: application_metadata.csv
+  demographics: demographics.csv
+  loan_details: loan_details.xlsx
+  financial_ratios: financial_ratios.jsonl
+  credit_history: credit_history.parquet
 split:
-  date_column: "account_open_year"
-  train_end: "2023-06-30"
-  valid_end: "2023-09-30"
+  date_column: "application_date"
+  train_end: "2021-12-31"
+  valid_end: "2022-12-31"
   client_id_col: "customer_ref"
   application_id_col: "application_id"
 target:
   column: "default"
   positive_label: 1
+  observation_window_months: 12
+  performance_window_months: 12
 preprocessing:
-  categorical_encoder: target
+  categorical_encoder: frequency
   target_encoding:
     smoothing: 5.0
   advanced:
@@ -37,6 +45,15 @@ preprocessing:
 merging:
   id_col: "customer_ref"
   application_id_col: "application_id"
+  id_like_cols:
+    - customer_ref
+    - application_id
+    - referral_code
+    - customer_id
+    - cust_id
+    - cust_num
+    - loan_officer_id
+    - marketing_campaign
   credit_history_date_col: "statement_date"
   dpd_thresholds: [30, 60, 90]
 feature_engineering:
@@ -44,6 +61,9 @@ feature_engineering:
     dti: ["total_debt_amount", "monthly_income"]
     utilization: ["credit_usage_amount", "available_credit"]
     payment_rate: ["monthly_payment", "monthly_income"]
+    loan_to_income: ["loan_amount", "annual_income"]
+    payment_to_income: ["monthly_payment", "annual_income"]
+    behavior_dti: ["total_monthly_debt_payment", "monthly_income"]
   numeric_aggregations:
     monthly_payment: ["mean", "max", "std"]
     loan_amount: ["mean", "max"]
@@ -51,6 +71,16 @@ feature_engineering:
   rolling_windows: [3, 6, 12]
   trend_features: ["credit_utilization", "monthly_payment", "loan_amount"]
   delinquency_markers: ["dpd_30_flag", "dpd_60_flag", "dpd_90_flag"]
+  log_features:
+    - loan_amount
+    - monthly_income
+    - annual_income
+    - total_debt_amount
+    - credit_usage_amount
+  winsorize:
+    loan_amount: [0.01, 0.99]
+    monthly_income: [0.01, 0.99]
+    annual_income: [0.01, 0.99]
   event_markers:
     high_utilization:
       column: "credit_utilization"
@@ -78,18 +108,27 @@ modeling:
     bins: 5
     woe_features: []
   lightgbm:
-    n_estimators: 1200
+    n_estimators: 600
     learning_rate: 0.05
     max_depth: -1
     subsample: 0.85
     colsample: 0.9
     tuning:
       enabled: true
-      n_trials: 8
+      n_trials: 4
       learning_rate: [0.02, 0.08]
       num_leaves: [32, 128]
+    suspicious:
+      auc: 0.99
+      ks: 0.99
+      pr_auc: 0.99
+      brier: 0.0001
+    sanity_check:
+      enabled: true
+      sample_size: 20000
+      auc_threshold: 0.62
   catboost:
-    iterations: 500
+    iterations: 400
     learning_rate: 0.03
     depth: 6
     l2_leaf_reg: 6.0
@@ -99,6 +138,22 @@ modeling:
       depth: [4, 8]
       learning_rate: [0.02, 0.08]
       l2_leaf_reg: [2.0, 10.0]
+    suspicious:
+      auc: 0.99
+      ks: 0.99
+      pr_auc: 0.99
+      brier: 0.0001
+    sanity_check:
+      enabled: true
+      sample_size: 20000
+      auc_threshold: 0.62
+feature_selection:
+  suspicious_auc: 0.98
+  weak_auc_tolerance: 0.02
+  low_variance_ratio: 0.001
+  drop_weak: true
+  mutual_info_sample: 20000
+  report_top_k: 20
 calibration:
   enabled: true
 scorecard:

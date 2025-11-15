@@ -34,13 +34,13 @@ class MonotonicBinner:
             series = pd.to_numeric(X[col], errors="coerce")
             valid = series.dropna()
             if valid.nunique() <= 1:
-                LOGGER.warning("Skipping column %s for WOE binning (insufficient variance)", col)
+                LOGGER.info("Skipping column %s for WOE binning (insufficient variance)", col)
                 continue
             quantiles = np.linspace(0, 1, self.bins + 1)
             edges = np.nanquantile(valid, quantiles)
             edges = np.unique(edges[~np.isnan(edges)])
             if len(edges) < 2:
-                LOGGER.warning("Could not derive monotonic bins for %s", col)
+                LOGGER.info("Could not derive monotonic bins for %s", col)
                 continue
             self.bin_edges_[col] = edges
         return self
@@ -72,12 +72,12 @@ class WOETransformer(BaseEstimator, TransformerMixin):
             stats["good"] = stats["count"] - stats["sum"]
             stats = stats[(stats["count"] >= self.min_samples) & (stats["sum"] > 0)]
             if stats.empty:
-                LOGGER.warning("No valid bins for %s after filtering", col)
+                LOGGER.info("No valid bins for %s after filtering", col)
                 continue
             total_bad = stats["sum"].sum()
             total_good = stats["good"].sum()
             if total_bad == 0 or total_good == 0:
-                LOGGER.warning("Imbalanced bins for %s (bad=%s good=%s)", col, total_bad, total_good)
+                LOGGER.info("Imbalanced bins for %s (bad=%s good=%s)", col, total_bad, total_good)
                 continue
             woe_map: Dict[pd.Interval, float] = {}
             iv = 0.0
@@ -92,7 +92,7 @@ class WOETransformer(BaseEstimator, TransformerMixin):
                 woe_map[interval] = woe
                 iv += (bad_rate - good_rate) * woe
             if not woe_map:
-                LOGGER.warning("WOE mapping empty for %s", col)
+                LOGGER.info("WOE mapping empty for %s", col)
                 continue
             self.woe_mappings_[col] = woe_map
             self.iv_[col] = iv

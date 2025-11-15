@@ -32,7 +32,8 @@ class ScorecardConfig:
 
 
 def pd_to_score(pd_values: np.ndarray, cfg: ScorecardConfig) -> np.ndarray:
-    odds = (1 - pd_values) / np.clip(pd_values, 1e-6, 1)
+    pd_safe = np.clip(pd_values, 1e-6, 1 - 1e-6)
+    odds = (1 - pd_safe) / pd_safe
     score = cfg.offset + cfg.factor * np.log(odds)
     return np.clip(score, cfg.min_score, cfg.max_score)
 

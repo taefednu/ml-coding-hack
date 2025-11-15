@@ -5,7 +5,7 @@ CONFIG := configs/default.yaml
 INPUT ?= data/sample_applications.csv
 OUTPUT ?= artifacts/predictions.csv
 
-.PHONY: venv inventory eda train evaluate predict api tests
+.PHONY: venv inventory eda train master_table evaluate predict api tests
 
 venv:
 	$(PYTHON) -m venv $(VENV)
@@ -17,6 +17,9 @@ inventory:
 
 eda:
 	$(ACTIVATE) $(PYTHON) scripts/eda_report.py --config $(CONFIG)
+
+master_table:
+	$(ACTIVATE) $(PYTHON) scripts/build_master_table.py --data-dir data/ml_coding_hackathon --output artifacts/master_table.parquet
 
 train:
 	$(ACTIVATE) $(PYTHON) scripts/train.py --config $(CONFIG)

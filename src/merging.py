@@ -75,6 +75,7 @@ def _deduplicate(df: pd.DataFrame, keys: List[str]) -> pd.DataFrame:
 def build_credit_history_aggregates(
     history_df: Optional[pd.DataFrame],
     config: MergeConfig,
+    application_dates: Optional[pd.Series] = None,
 ) -> pd.DataFrame:
     if history_df is None or history_df.empty:
         return pd.DataFrame(columns=[config.id_col])
@@ -90,6 +91,12 @@ def build_credit_history_aggregates(
     else:
         date_col = "__synthetic_date__"
         df[date_col] = pd.Timestamp.utcnow()
+    if date_col and application_dates is not None:
+        mapped_dates = pd.to_datetime(application_dates, errors="coerce")
+        df["__application_date__"] = df[entity_col].map(mapped_dates)
+        df = df.dropna(subset=["__application_date__"])
+        df = df[df[date_col] <= df["__application_date__"]]
+        df = df.drop(columns="__application_date__", errors="ignore")
 
     dpd_col = _match_column(df.columns, ["dpd", "days_past_due"])
     if dpd_col:
@@ -177,6 +184,9 @@ def build_master_table(
 ) -> Tuple[pd.DataFrame, Dict[str, Dict[str, float]]]:
     cfg = config or MergeConfig()
     base = prepare_application_metadata(application_df, cfg)
+    application_dates = None
+    if cfg.application_datetime_col and cfg.application_datetime_col in base.columns:
+        application_dates = base.set_index(cfg.id_col)[cfg.application_datetime_col]
     coverage_report: Dict[str, Dict[str, float]] = {}
 
     merge_plan = [
@@ -188,7 +198,7 @@ def build_master_table(
         base, stats = _merge(base, frame, keys, name)
         coverage_report[name] = stats
 
-    history_agg = build_credit_history_aggregates(history_df, cfg)
+    history_agg = build_credit_history_aggregates(history_df, cfg, application_dates=application_dates)
     base, stats = _merge(base, history_agg, [cfg.id_col], "credit_history")
     coverage_report["credit_history"] = stats
 

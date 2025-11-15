@@ -359,20 +359,22 @@ class AdvancedPreprocessor:
         return self.fit(df, y=y).transform(df)
 
     def _transform_numeric(self, df: pd.DataFrame) -> pd.DataFrame:
-        out = pd.DataFrame(index=df.index)
+        data: Dict[str, pd.Series] = {}
         for col in self.numeric_cols_:
             stats = self.numeric_stats_[col]
             series = pd.to_numeric(df.get(col), errors="coerce")
             missing_flag = series.isna().astype(int)
-            out[f"{col}_was_missing"] = missing_flag
+            data[f"{col}_was_missing"] = missing_flag
             series = series.fillna(stats["median"])
             series = series.clip(stats["lower"], stats["upper"])
             if stats["log"]:
                 series = np.log1p(series + stats["shift"])
             if self.config.scale_numeric and stats["scale_std"]:
                 series = (series - stats["scale_mean"]) / (stats["scale_std"] + 1e-6)
-            out[col] = series
-        return out
+            data[col] = series
+        if not data:
+            return pd.DataFrame(index=df.index)
+        return pd.DataFrame(data, index=df.index)
 
     def _normalize_category(self, series: pd.Series, allowed: Set[str]) -> pd.Series:
         normalized = series.astype(str).str.strip().str.lower()
@@ -382,31 +384,34 @@ class AdvancedPreprocessor:
         return normalized
 
     def _transform_categorical(self, df: pd.DataFrame) -> pd.DataFrame:
-        out = pd.DataFrame(index=df.index)
+        data: Dict[str, pd.Series] = {}
         encoding = self.config.categorical_encoding.lower()
         for col in self.categorical_cols_:
             allowed = self.categorical_allowed_[col]
             series = df[col] if col in df.columns else pd.Series(self.missing_token, index=df.index)
             normalized = self._normalize_category(series, allowed)
-            out[f"{col}_was_missing"] = (normalized == self.missing_token).astype(int)
+            data[f"{col}_was_missing"] = (normalized == self.missing_token).astype(int)
             if encoding == "onehot":
                 categories = self.category_levels_[col]
                 cat = pd.Categorical(normalized, categories=categories)
                 dummies = pd.get_dummies(cat, prefix=col)
                 expected = [f"{col}_{category}" for category in cat.categories]
                 dummies = dummies.reindex(columns=expected, fill_value=0)
-                out = pd.concat([out, dummies], axis=1)
+                for dummy_col in dummies.columns:
+                    data[dummy_col] = dummies[dummy_col]
             elif encoding == "frequency":
                 freq_map = self.frequency_maps_[col]
                 encoded = normalized.map(freq_map).fillna(freq_map.get(self.other_token, 0.0))
-                out[f"{col}_freq"] = encoded
+                data[f"{col}_freq"] = encoded
             elif encoding == "target":
                 mapping = self.target_maps_[col]
                 encoded = normalized.map(mapping).fillna(self.global_target_mean_)
-                out[f"{col}_target"] = encoded
+                data[f"{col}_target"] = encoded
             else:
                 raise ValueError(f"Unknown categorical encoding '{self.config.categorical_encoding}'")
-        return out
+        if not data:
+            return pd.DataFrame(index=df.index)
+        return pd.DataFrame(data, index=df.index)
 
 
 __all__ = [

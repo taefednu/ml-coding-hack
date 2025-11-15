@@ -46,6 +46,8 @@ class FeatureSpec:
     volatility_features: List[str] = field(default_factory=list)
     time_since_event_cols: List[str] = field(default_factory=list)
     active_loan_indicator: Optional[str] = None
+    log_features: List[str] = field(default_factory=list)
+    winsorize: Dict[str, List[float]] = field(default_factory=dict)
 
 
 DEFAULT_SPEC = FeatureSpec(
@@ -74,6 +76,8 @@ DEFAULT_SPEC = FeatureSpec(
     volatility_features=["balance", "payment_amount"],
     time_since_event_cols=["dpd_30_flag", "dpd_60_flag"],
     active_loan_indicator="account_status",
+    log_features=[],
+    winsorize={},
 )
 
 
@@ -104,14 +108,16 @@ def spec_from_config(cfg: Optional[dict]) -> FeatureSpec:
         numeric_aggs=cfg.get("numeric_aggregations", DEFAULT_SPEC.numeric_aggs),
         rolling_windows=cfg.get("rolling_windows", DEFAULT_SPEC.rolling_windows),
         trend_features=cfg.get("trend_features", DEFAULT_SPEC.trend_features),
-        delinquency_markers=cfg.get("delinquency_markers", DEFAULT_SPEC.delinquency_markers),
-        event_markers=events or DEFAULT_SPEC.event_markers,
-        behavioral_flags=behaviors or DEFAULT_SPEC.behavioral_flags,
-        segment_normalization=cfg.get("segment_normalization", DEFAULT_SPEC.segment_normalization),
-        volatility_features=cfg.get("volatility_features", DEFAULT_SPEC.volatility_features),
-        time_since_event_cols=cfg.get("time_since_event_cols", DEFAULT_SPEC.time_since_event_cols),
-        active_loan_indicator=cfg.get("active_loan_indicator", DEFAULT_SPEC.active_loan_indicator),
-    )
+    delinquency_markers=cfg.get("delinquency_markers", DEFAULT_SPEC.delinquency_markers),
+    event_markers=events or DEFAULT_SPEC.event_markers,
+    behavioral_flags=behaviors or DEFAULT_SPEC.behavioral_flags,
+    segment_normalization=cfg.get("segment_normalization", DEFAULT_SPEC.segment_normalization),
+    volatility_features=cfg.get("volatility_features", DEFAULT_SPEC.volatility_features),
+    time_since_event_cols=cfg.get("time_since_event_cols", DEFAULT_SPEC.time_since_event_cols),
+    active_loan_indicator=cfg.get("active_loan_indicator", DEFAULT_SPEC.active_loan_indicator),
+    log_features=cfg.get("log_features", DEFAULT_SPEC.log_features),
+    winsorize=cfg.get("winsorize", DEFAULT_SPEC.winsorize),
+)
 
 
 def _safe_ratio(num: pd.Series, den: pd.Series) -> pd.Series:
@@ -269,6 +275,36 @@ def build_segment_norm(df: pd.DataFrame, spec: FeatureSpec) -> pd.DataFrame:
     return out
 
 
+def build_log_features(df: pd.DataFrame, spec: FeatureSpec) -> pd.DataFrame:
+    if not spec.log_features:
+        return pd.DataFrame(index=df.index)
+    out = pd.DataFrame(index=df.index)
+    for col in spec.log_features:
+        if col not in df.columns:
+            continue
+        numeric = pd.to_numeric(df[col], errors="coerce")
+        numeric = numeric.clip(lower=0)
+        out[f"{col}_log1p"] = np.log1p(numeric)
+    return out
+
+
+def build_winsorized(df: pd.DataFrame, spec: FeatureSpec) -> pd.DataFrame:
+    if not spec.winsorize:
+        return pd.DataFrame(index=df.index)
+    out = pd.DataFrame(index=df.index)
+    for col, limits in spec.winsorize.items():
+        if col not in df.columns:
+            continue
+        numeric = pd.to_numeric(df[col], errors="coerce")
+        if numeric.dropna().empty:
+            continue
+        lower_q, upper_q = (limits + [0.01, 0.99])[:2] if isinstance(limits, list) else (0.01, 0.99)
+        lower = numeric.quantile(lower_q)
+        upper = numeric.quantile(upper_q)
+        out[f"{col}_winsor"] = numeric.clip(lower, upper)
+    return out
+
+
 def build_volatility(df: pd.DataFrame, spec: FeatureSpec, entity_col: Optional[str]) -> pd.DataFrame:
     if not entity_col or entity_col not in df.columns:
         return pd.DataFrame(index=df.index)
@@ -355,6 +391,8 @@ def build_features(
     time_since_df = build_time_since_events(df, spec, date_col, entity_col)
     active_df = build_active_loan_features(df, spec, entity_col)
     macro_df = build_macro_time_features(df)
+    log_df = build_log_features(df, spec)
+    winsor_df = build_winsorized(df, spec)
     features = pd.concat(
         [
             ratio_df,
@@ -369,10 +407,15 @@ def build_features(
             time_since_df,
             active_df,
             macro_df,
+            log_df,
+            winsor_df,
         ],
         axis=1,
     )
-    features = features.replace([np.inf, -np.inf], np.nan)
+    numeric_cols = features.select_dtypes(include=["number"]).columns
+    if len(numeric_cols) > 0:
+        features[numeric_cols] = features[numeric_cols].replace([np.inf, -np.inf], np.nan)
+    features = features.infer_objects(copy=False)
     LOGGER.info("Generated %d engineered features", features.shape[1])
     return features
 

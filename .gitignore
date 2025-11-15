@@ -27,6 +27,7 @@ mlruns/
 *.parquet
 *.pkl
 tmp_model.pkl
+tmp/
 
 # OS noise
 .DS_Store
