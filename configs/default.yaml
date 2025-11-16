@@ -1,0 +1,256 @@
+seed: 211
+paths:
+  data_dir: data/ml_coding_hackathon
+  artifacts_dir: artifacts
+  models_dir: models
+  reports_dir: artifacts/reports
+  inventory_report: artifacts/data_inventory.json
+  master_table: artifacts/master_table.parquet
+data_sources:
+  application: application_metadata.csv
+  demographics: demographics.csv
+  loan_details: loan_details.xlsx
+  financial_ratios: financial_ratios.jsonl
+  credit_history: credit_history.parquet
+split:
+  date_column: "application_date"
+  train_end: "2021-12-31"
+  valid_end: "2022-12-31"
+  client_id_col: "customer_ref"
+  application_id_col: "application_id"
+target:
+  column: "default"
+  positive_label: 1
+  observation_window_months: 12
+  performance_window_months: 12
+preprocessing:
+  categorical_encoder: frequency
+  target_encoding:
+    smoothing: 20.0
+  advanced:
+    target_col: "default"
+    id_col: "customer_ref"
+    winsor_limits: [0.005, 0.995]
+    log_skew_threshold: 0.8
+    rare_category_threshold: 0.005
+    categorical_encoding: target
+    enable_woe: true
+    woe_features:
+      - loan_amount
+      - interest_rate
+      - debt_to_income_ratio
+      - credit_utilization
+    scale_numeric: false
+    keep_id: true
+merging:
+  id_col: "customer_ref"
+  application_id_col: "application_id"
+  id_like_cols:
+    - customer_ref
+    - application_id
+    - referral_code
+    - customer_id
+    - cust_id
+    - cust_num
+    - loan_officer_id
+    - marketing_campaign
+  credit_history_date_col: "statement_date"
+  dpd_thresholds: [30, 60, 90]
+feature_engineering:
+  advanced_behavioral_features: true
+  interactions:
+    enabled: true
+    top_k: 12
+    max_pairs: 20
+    min_spearman_correlation: 0.05
+  ratios:
+    dti: ["total_debt_amount", "monthly_income"]
+    utilization: ["credit_usage_amount", "available_credit"]
+    payment_rate: ["monthly_payment", "monthly_income"]
+    loan_to_income: ["loan_amount", "annual_income"]
+    payment_to_income: ["monthly_payment", "annual_income"]
+    behavior_dti: ["total_monthly_debt_payment", "monthly_income"]
+    expense_to_income: ["existing_monthly_debt", "monthly_income"]
+    cash_flow_margin: ["monthly_free_cash_flow", "monthly_income"]
+    payment_vs_cash_flow: ["monthly_payment", "monthly_free_cash_flow"]
+    revolving_limit_utilization: ["revolving_balance", "total_credit_limit_mean_hist"]
+  numeric_aggregations:
+    monthly_payment: ["mean", "max", "std"]
+    loan_amount: ["mean", "max"]
+    credit_utilization: ["mean", "max"]
+  rolling_windows: [3, 6, 12, 18]
+  trend_features: ["credit_utilization", "monthly_payment", "loan_amount", "monthly_income", "revolving_balance"]
+  delinquency_markers: ["dpd_30_flag", "dpd_60_flag", "dpd_90_flag"]
+  log_features:
+    - loan_amount
+    - monthly_income
+    - annual_income
+    - total_debt_amount
+    - credit_usage_amount
+    - monthly_payment
+    - monthly_free_cash_flow
+  winsorize:
+    loan_amount: [0.01, 0.99]
+    monthly_income: [0.01, 0.99]
+    annual_income: [0.01, 0.99]
+    total_debt_amount: [0.01, 0.99]
+    credit_usage_amount: [0.01, 0.99]
+    monthly_payment: [0.01, 0.99]
+    monthly_free_cash_flow: [0.01, 0.99]
+    total_monthly_debt_payment: [0.01, 0.99]
+  event_markers:
+    high_utilization:
+      column: "credit_utilization"
+      threshold: 0.85
+    service_issues:
+      column: "num_customer_service_calls"
+      threshold: 3
+  behavioral_flags:
+    digital_engagement:
+      column: "num_login_sessions"
+      threshold: 8
+      operator: ">="
+    mobile_first:
+      column: "has_mobile_app"
+      threshold: 1
+      operator: "=="
+    high_dti:
+      column: "debt_to_income_ratio"
+      threshold: 60
+      operator: ">="
+    tight_cash_flow:
+      column: "monthly_free_cash_flow"
+      threshold: 0
+      operator: "<="
+  segment_normalization:
+    monthly_income: "employment_type"
+    loan_amount: "employment_type"
+  volatility_features: ["monthly_payment", "credit_utilization", "revolving_balance"]
+  time_since_event_cols: ["dpd_30_flag", "dpd_60_flag", "dpd_90_flag"]
+  active_loan_indicator: "account_status_code"
+  interaction_pairs:
+    - ["debt_to_income_ratio", "credit_utilization"]
+    - ["loan_amount", "monthly_income"]
+    - ["monthly_payment", "monthly_income"]
+    - ["loan_amount", "interest_rate"]
+    - ["payment_to_income_ratio", "credit_utilization"]
+modeling:
+  cv_folds: 3
+  logistic:
+    bins: 5
+    woe_features: []
+  lightgbm:
+    n_estimators: 1500
+    learning_rate: 0.05
+    max_depth: -1
+    subsample: 0.85
+    colsample: 0.9
+    optimize_class_weight: true
+    monotone_constraints:
+      all_numeric: increasing
+    tuning:
+      enabled: true
+      use_optuna: true
+      n_trials: 75
+      learning_rate: [0.01, 0.08]
+      num_leaves: [32, 192]
+      min_child_samples: [50, 500]
+      subsample: [0.7, 1.0]
+      colsample: [0.6, 1.0]
+      reg_lambda: [0.0, 50.0]
+      reg_alpha: [0.0, 20.0]
+    suspicious:
+      auc: 0.99
+      ks: 0.99
+      pr_auc: 0.99
+      brier: 0.0001
+    sanity_check:
+      enabled: true
+      sample_size: 20000
+      auc_threshold: 0.62
+  catboost:
+    iterations: 1500
+    learning_rate: 0.05
+    depth: 6
+    l2_leaf_reg: 3.0
+    optimize_class_weight: true
+    monotone_constraints:
+      all_numeric: increasing
+    tuning:
+      enabled: true
+      use_optuna: true
+      n_trials: 50
+      depth: [4, 8]
+      learning_rate: [0.02, 0.08]
+      l2_leaf_reg: [2.0, 10.0]
+      subsample: [0.7, 1.0]
+      colsample_bylevel: [0.6, 1.0]
+    suspicious:
+      auc: 0.99
+      ks: 0.99
+      pr_auc: 0.99
+      brier: 0.0001
+    sanity_check:
+      enabled: true
+      sample_size: 20000
+      auc_threshold: 0.62
+  ensemble:
+    enabled: true
+    n_trials: 150
+    min_weight: 0.05
+  xgboost:
+    n_estimators: 1500
+    learning_rate: 0.05
+    max_depth: 6
+    subsample: 0.8
+    colsample: 0.8
+    optimize_class_weight: true
+    monotone_constraints:
+      all_numeric: increasing
+    tuning:
+      enabled: true
+      use_optuna: true
+      n_trials: 50
+  stacking:
+    enabled: true
+    n_folds: 5
+feature_selection:
+  suspicious_auc: 0.98
+  weak_auc_tolerance: 0.02
+  low_variance_ratio: 0.001
+  drop_weak: false
+  min_spearman_correlation: 0.05  # Mandatory minimum Spearman correlation
+  drop_weak_spearman: true  # Automatically drop features below threshold
+  mutual_info_sample: 20000
+  report_top_k: 20
+  use_shap_selection: false
+  shap_top_k: 100
+calibration:
+  enabled: true
+scorecard:
+  pdo: 50
+  base_odds: 20
+  base_score: 650
+explainability:
+  shap_max_samples: 500
+  reason_codes_top_k: 3
+  reason_codes_max_samples: 200
+drift:
+  buckets: 10
+metrics:
+  primary: "ROC_AUC"
+  cost_matrix:
+    - [0, -1]
+    - [-8, 0]
+fairness:
+  sensitive_cols: []
+  min_group_size: 50
+logging:
+  level: INFO
+environment:
+  resource_limits:
+    cpus: 4
+    memory_gb: 16
+    disk_gb: 20
+monotone:
+  features: []
