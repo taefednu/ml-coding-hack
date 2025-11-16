@@ -1,0 +1,11 @@
+feature,mean_abs_shap
+credit_score,0.3952389271945199
+age,0.3004588338075832
+monthly_free_cash_flow,0.2450306873190172
+monthly_income,0.1870105375369111
+annual_income,0.14373529464896265
+num_credit_accounts,0.11061139303136011
+credit_utilization,0.0963064480438286
+cash_flow_ratio,0.07599695684123645
+total_debt_amount,0.05323609170734996
+available_credit,0.05166957305690325
