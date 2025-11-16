@@ -42,9 +42,10 @@ models/, artifacts/       # артефакты (champion.pkl, challenger.pkl, ca
 ```
 
 ## Данные, таргет и сплиты
-- **RAW**: `data/ml_coding_hackathon/*` (UTF-8/CP1251, `,`/`;`/`\t`, Parquet, JSONL, XML, XLSX). `make inventory` генерирует `artifacts/data_inventory.json` + Markdown EDA (`artifacts/reports/eda_report.md`).
+- **RAW Training**: `data/train/*` (UTF-8/CP1251, `,`/`;`/`\t`, Parquet, JSONL, XML, XLSX). `make inventory` генерирует `artifacts/data_inventory.json` + Markdown EDA (`artifacts/reports/eda_report.md`).
+- **RAW Evaluation**: `data/evaluation_set/*` — данные для финального тестирования хакатона. Обрабатываются так же, как training данные.
 - **Таргет**: по возможности `default_flag`/`label`. Если нет — `bad_90 = 1`, если `overdue_90d > 0` или `dpd_90 >= 1` (логика фиксируется в README/config). Плейсхолдер `<<TARGET_DEF>>` заменяется после выбора.
-- **Сплиты**: строгие по времени: `train <= 2023-06-30`, `valid ∈ (2023-06-30; 2023-09-30]`, `OOT > 2023-09-30`. Внутри моделей используем `TimeSeriesSplit` + Group по `<<CLIENT_ID_COL>>`, чтобы клиент не попадал в разные фолды.
+- **Сплиты**: строгие по времени: `train <= 2021-12-31`, `valid ∈ (2021-12-31; 2022-12-31]`, `OOT > 2022-12-31`. Внутри моделей используем `TimeSeriesSplit` + Group по `customer_ref`, чтобы клиент не попадал в разные фолды.
 
 ## Feature Engineering (мини Upstart/VantageScore)
 - **Ratios**: DTI, utilization, debt-service, custom ratios из конфига.
@@ -53,14 +54,19 @@ models/, artifacts/       # артефакты (champion.pkl, challenger.pkl, ca
 - **Trended data**: прирост/наклон по доходу/балансу на клиента (если есть временные ряды).
 - **Risk events**: флаги high utilization, количество просрочек 30/60/90+, реструктуризаций.
 - **Segment normalization**: доход/балансы относительно среднего по региону/типу занятости.
+- **Advanced Behavioral Features**: DPD counters, trends, volatility, stress indicators из credit_history (включая 3/6/12-месячные окна).
+- **Default Detection Features**: специализированные признаки для детекции дефолта — комбинации риска, взаимодействия признаков, скоринговые признаки, поведенческие флаги, тройные взаимодействия.
+- **Smart Interactions**: автоматическая генерация взаимодействий между топ-K признаками (product, ratio, difference) с фильтрацией по Spearman correlation.
 - **Config-driven**: `configs/default.yaml::feature_engineering` описывает маппинги, чтобы быстро адаптироваться под реальные колонки.
 
 ## Champion vs Challenger
 | Модель | Назначение | Файл | Особенности |
 |--------|------------|------|-------------|
 | **Champion** | Регуляторно-дружественный baseline | `models/champion_model.pkl` | Logistic Regression + WOE/IV с монотонными биннами. Экспорт коэффициентов и bins (`artifacts/champion_explainability.json`). |
-| **Challenger** | ML-мотор AUC | `models/challenger_model.pkl` | CatBoost (приоритет) / LightGBM с class weights, TimeSeries+Group-CV, лёгкое random tuning (`modeling.py`). SHAP/feature importance сохраняются (`artifacts/challenger_shap.json`). |
-| **Production best** | Используется для PD/score | `models/best_model.pkl` | Совпадает с Challenger, если он лучше Champion. |
+| **Challenger** | ML-мотор AUC | `models/challenger_model.pkl` | CatBoost / LightGBM / XGBoost с Optuna tuning, class weights, monotonic constraints, TimeSeries+Group-CV. SHAP/feature importance сохраняются (`artifacts/challenger_shap.json`). |
+| **Ensemble** | Взвешенный ансамбль | `models/ensemble_model.pkl` | Оптимизация весов под ROC-AUC, PR-AUC или F1. |
+| **Stacking** | Стекинг-ансамбль | `models/stacking_model.pkl` | Мета-модель (Logistic Regression) на предсказаниях базовых моделей. Автоматическая оптимизация порога под F1/F2. Сравнение стекинга vs усреднения. |
+| **Production best** | Используется для PD/score | `models/best_model.pkl` | Лучшая модель по валидационной метрике. |
 
 ## Калибровка и Scorecard 300–900
 - `src/calibration.py`: Platt vs Isotonic, выбирается лучшая по Brier/LogLoss на валидации и проверяется на OOT. Калибратор сохраняется в `models/calibrator.pkl`.
@@ -76,13 +82,14 @@ models/, artifacts/       # артефакты (champion.pkl, challenger.pkl, ca
 ## Как воспроизвести
 ```bash
 make venv
-make inventory   # автоинвентаризация и markdown-EDA
-make eda         # расширенный отчёт с графиками (fallback на matplotlib)
-make train       # Champion + Challenger + calibration + scorecard + XAI + артефакты
-make evaluate    # OOT-метрики, reliability, fairness
-make predict INPUT=data/new_apps.csv OUTPUT=artifacts/predictions.csv
-make api         # FastAPI на http://localhost:8080
-make tests       # pytest (data loading, leakage, metrics, API)
+make inventory        # автоинвентаризация и markdown-EDA (использует data/train)
+make eda              # расширенный отчёт с графиками (fallback на matplotlib)
+make train            # Champion + Challenger + Ensemble + Stacking + calibration + scorecard + XAI + артефакты
+make evaluate         # OOT-метрики, reliability, fairness
+make predict INPUT=data/new_apps.csv OUTPUT=artifacts/predictions.csv  # предсказание на произвольном файле
+make predict_evaluation  # предсказание на evaluation_set (data/evaluation_set)
+make api              # FastAPI на http://localhost:8080
+make tests            # pytest (data loading, leakage, metrics, API)
 ```
 
 ## API и батч-скоринг
@@ -94,7 +101,9 @@ make tests       # pytest (data loading, leakage, metrics, API)
        -H 'Content-Type: application/json' \
        -d '{"features": {"age": 35, "monthly_income": 12000000, "dpd_90": 0}}'
   ```
-- **Batch** (`scripts/predict.py`): `python scripts/predict.py --config configs/default.yaml --input data/applications.parquet --output artifacts/applications_scored.csv`.
+- **Batch** (`scripts/predict.py`): 
+  - Произвольный файл: `python scripts/predict.py --config configs/default.yaml --input data/applications.parquet --output artifacts/applications_scored.csv`
+  - Evaluation set: `python scripts/predict.py --config configs/default.yaml --evaluation` (автоматически обрабатывает `data/evaluation_set` и сохраняет в `artifacts/evaluation_predictions.csv`)
 
 ## Тесты
 - `tests/test_data_loading.py` — схемы, кодировки, multi-format ingest.

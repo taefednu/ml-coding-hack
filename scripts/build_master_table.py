@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-dir",
         type=Path,
-        default=Path("data/ml_coding_hackathon"),
+        default=Path("data/train"),
         help="Directory containing the raw source files.",
     )
     parser.add_argument(

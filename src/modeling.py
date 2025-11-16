@@ -114,7 +114,12 @@ class TrainedModel:
         if self.name == "stacking" and "base_models" in self.extras:
             base_models = self.extras.get("base_models", [])
             base_preds = np.column_stack([m.predict_proba(df) for m in base_models])
-            return self.estimator.predict_proba(base_preds)[:, 1]
+            strategy = self.extras.get("strategy", "stacking")
+            if strategy == "stacking" and self.estimator is not None:
+                return self.estimator.predict_proba(base_preds)[:, 1]
+            else:
+                # Use averaging if stacking wasn't better
+                return np.mean(base_preds, axis=1)
         return self.estimator.predict_proba(df[self.feature_cols])[:, 1]
 
 
@@ -519,6 +524,7 @@ def train_weighted_ensemble(
     target: str,
     cfg: Optional[Dict[str, Any]] = None,
 ) -> Optional[TrainedModel]:
+    """Train weighted ensemble with optimization for different metrics (AUC, PR-AUC, etc.)"""
     if not cfg or not cfg.get("enabled", True):
         return None
     available: List[TrainedModel] = [m for m in models if m is not None]
@@ -530,6 +536,10 @@ def train_weighted_ensemble(
     train_matrix = np.column_stack([m.predict_proba(train) for m in available])
     if valid_matrix.ndim != 2 or valid_matrix.shape[1] < 2:
         return None
+    
+    # Determine optimization metric
+    optimize_metric = cfg.get("optimize_metric", "roc_auc")  # "roc_auc", "pr_auc", "f1"
+    
     rng = np.random.default_rng(int(cfg.get("seed", 42)))
     n_trials = int(cfg.get("n_trials", 64))
     min_weight = float(cfg.get("min_weight", 0.0))
@@ -546,20 +556,38 @@ def train_weighted_ensemble(
             weights = np.clip(weights, min_weight, None)
             weights = weights / weights.sum()
         candidates.append(weights)
-    best_auc = -math.inf
+    
+    # Score function for optimization
+    from sklearn.metrics import average_precision_score, f1_score, precision_recall_curve
+    
+    def score_weights(weights, pred_matrix, y_true, metric):
+        combined = pred_matrix @ weights
+        if metric == "roc_auc":
+            return roc_auc_score(y_true, combined)
+        elif metric == "pr_auc":
+            return average_precision_score(y_true, combined)
+        elif metric == "f1":
+            precision, recall, thresholds = precision_recall_curve(y_true, combined)
+            f1_scores = 2 * (precision * recall) / (precision + recall + 1e-6)
+            return np.max(f1_scores)
+        else:
+            return roc_auc_score(y_true, combined)
+    
+    best_score = -math.inf
     best_weights = candidates[0]
     best_valid = valid_matrix @ best_weights
     for weights in candidates:
-        combined = valid_matrix @ weights
-        auc = roc_auc_score(y_valid, combined)
-        if auc > best_auc:
-            best_auc = auc
+        score = score_weights(weights, valid_matrix, y_valid, optimize_metric)
+        if score > best_score:
+            best_score = score
             best_weights = weights
-            best_valid = combined
+            best_valid = valid_matrix @ weights
+    
     valid_metrics = report_to_dict(compute_metrics(y_valid, best_valid))
     train_pred = train_matrix @ best_weights
     train_metrics = report_to_dict(compute_metrics(y_train, train_pred))
     valid_metrics["train_roc_auc"] = train_metrics.get("roc_auc")
+    valid_metrics[f"optimized_{optimize_metric}"] = best_score
     suspicious = any(m.extras.get("is_suspicious") for m in available if isinstance(m.extras, dict))
     extras = {
         "base_models": available,
@@ -567,9 +595,12 @@ def train_weighted_ensemble(
         "is_suspicious": suspicious,
     }
     LOGGER.info(
-        "Ensemble weights %s produced valid ROC-AUC %.4f",
+        "Ensemble weights %s produced valid ROC-AUC %.4f, PR-AUC %.4f (optimized for %s=%.4f)",
         np.round(best_weights, 3).tolist(),
         valid_metrics["roc_auc"],
+        valid_metrics.get("pr_auc", 0.0),
+        optimize_metric,
+        best_score,
     )
     return TrainedModel(
         name="ensemble",
@@ -910,11 +941,15 @@ def train_stacking_ensemble(
     target: str,
     cfg: Optional[Dict[str, Any]] = None,
 ) -> Optional[TrainedModel]:
-    """Train stacking ensemble with Logistic Regression meta-learner using out-of-fold predictions."""
+    """Train stacking ensemble with Logistic Regression meta-learner using out-of-fold predictions.
+    
+    Also optimizes threshold for F1/F2 score and compares stacking vs simple averaging.
+    """
     if not cfg or not cfg.get("enabled", True):
         return None
     from sklearn.model_selection import KFold
     from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import precision_recall_curve, f1_score, fbeta_score
     
     available = [m for m in models if m is not None and m.name != "logistic_woe"]
     if len(available) < 2:
@@ -946,15 +981,76 @@ def train_stacking_ensemble(
     
     # Final predictions
     stacked_pred = meta_model.predict_proba(valid_preds)[:, 1]
-    metrics = report_to_dict(compute_metrics(y_valid, stacked_pred))
-    LOGGER.info("Stacking ensemble valid ROC-AUC %.4f", metrics["roc_auc"])
+    
+    # Compare stacking vs simple averaging
+    simple_avg = np.mean(valid_preds, axis=1)
+    simple_auc = roc_auc_score(y_valid, simple_avg)
+    stacking_auc = roc_auc_score(y_valid, stacked_pred)
+    
+    # Choose best strategy
+    use_stacking = stacking_auc > simple_auc
+    if use_stacking:
+        final_pred = stacked_pred
+        strategy = "stacking"
+        LOGGER.info("Stacking ensemble: AUC=%.4f (stacking) vs %.4f (averaging) -> using stacking", 
+                   stacking_auc, simple_auc)
+    else:
+        final_pred = simple_avg
+        strategy = "averaging"
+        meta_model = None  # Don't store meta model if using averaging
+        LOGGER.info("Stacking ensemble: AUC=%.4f (stacking) vs %.4f (averaging) -> using averaging",
+                   stacking_auc, simple_auc)
+    
+    # Optimize threshold for F1 and F2 scores
+    precision, recall, thresholds = precision_recall_curve(y_valid, final_pred)
+    
+    # F1 optimization
+    f1_scores = 2 * (precision * recall) / (precision + recall + 1e-6)
+    optimal_f1_idx = np.argmax(f1_scores)
+    optimal_f1_threshold = thresholds[optimal_f1_idx] if optimal_f1_idx < len(thresholds) else 0.5
+    
+    # F2 optimization (recall weighted more)
+    f2_scores = (1 + 2**2) * (precision * recall) / (2**2 * precision + recall + 1e-6)
+    optimal_f2_idx = np.argmax(f2_scores)
+    optimal_f2_threshold = thresholds[optimal_f2_idx] if optimal_f2_idx < len(thresholds) else 0.5
+    
+    # Choose threshold based on metric preference
+    threshold_metric = cfg.get("threshold_metric", "f1")  # "f1", "f2", or "default" (0.5)
+    if threshold_metric == "f2":
+        optimal_threshold = optimal_f2_threshold
+    elif threshold_metric == "f1":
+        optimal_threshold = optimal_f1_threshold
+    else:
+        optimal_threshold = 0.5
+    
+    # Calculate metrics with optimal threshold
+    y_pred_optimal = (final_pred >= optimal_threshold).astype(int)
+    f1_optimal = f1_score(y_valid, y_pred_optimal)
+    f2_optimal = fbeta_score(y_valid, y_pred_optimal, beta=2)
+    
+    metrics = report_to_dict(compute_metrics(y_valid, final_pred))
+    metrics["f1_score"] = f1_optimal
+    metrics["f2_score"] = f2_optimal
+    metrics["optimal_threshold"] = float(optimal_threshold)
+    metrics["optimal_f1_threshold"] = float(optimal_f1_threshold)
+    metrics["optimal_f2_threshold"] = float(optimal_f2_threshold)
+    
+    LOGGER.info("Stacking ensemble valid ROC-AUC %.4f, PR-AUC %.4f, F1 %.4f, F2 %.4f (threshold=%.4f)",
+               metrics["roc_auc"], metrics["pr_auc"], f1_optimal, f2_optimal, optimal_threshold)
     
     return TrainedModel(
         name="stacking",
-        estimator=meta_model,
+        estimator=meta_model if use_stacking else None,
         metrics=metrics,
         feature_cols=[],
-        extras={"base_models": available, "n_folds": n_folds},
+        extras={
+            "base_models": available, 
+            "n_folds": n_folds,
+            "strategy": strategy,
+            "optimal_threshold": optimal_threshold,
+            "stacking_auc": float(stacking_auc),
+            "averaging_auc": float(simple_auc),
+        },
     )
 
 

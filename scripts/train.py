@@ -65,7 +65,11 @@ def _augment_with_features(
     if df_slice.empty:
         return df_slice.copy()
     entity = entity_col if entity_col and entity_col in df_slice.columns else None
-    engineered = build_features(df_slice, feature_cfg, date_col=date_col, entity_col=entity)
+    enable_default_detection = feature_cfg.get("enable_default_detection", False)
+    engineered = build_features(
+        df_slice, feature_cfg, date_col=date_col, entity_col=entity,
+        enable_default_detection=enable_default_detection
+    )
     augmented = pd.concat([df_slice, engineered], axis=1)
     augmented = augmented.loc[:, augmented.notna().any()]
     return augmented

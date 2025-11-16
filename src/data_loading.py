@@ -130,38 +130,57 @@ def _load_source(path: Optional[Path]) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def load_master_dataset(config: Dict[str, Any]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    id_col = config.get("merging", {}).get("id_col", "customer_ref")
-    application = _load_source(_resolve_source_path(config, "application"))
-    if application.empty:
-        raise RuntimeError("Application dataset is required and could not be loaded")
-    application = _standardize_customer_id(application, id_col)
-    application = _ensure_application_date(application, config)
-    demographics = _load_source(_resolve_source_path(config, "demographics"))
-    if not demographics.empty:
-        demographics = _standardize_customer_id(demographics, id_col)
-        demographics = _auto_cast_numeric(demographics, exclude=[id_col])
-    loan_details = _load_source(_resolve_source_path(config, "loan_details"))
-    if not loan_details.empty:
-        loan_details = _standardize_customer_id(loan_details, id_col)
-        loan_details = _auto_cast_numeric(loan_details, exclude=[id_col])
-    financial = _load_source(_resolve_source_path(config, "financial_ratios"))
-    if not financial.empty:
-        financial = _standardize_customer_id(financial, id_col)
-        financial = _auto_cast_numeric(financial, exclude=[id_col])
-    credit_history = _load_source(_resolve_source_path(config, "credit_history"))
-    if not credit_history.empty:
-        credit_history = _standardize_customer_id(credit_history, id_col)
-        credit_history = _auto_cast_numeric(credit_history, exclude=[id_col, config.get("merging", {}).get("credit_history_date_col")])
+def load_master_dataset(config: Dict[str, Any], use_evaluation: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Load master dataset from training or evaluation directory.
+    
+    Args:
+        config: Configuration dictionary
+        use_evaluation: If True, load from evaluation_dir instead of data_dir
+        
+    Returns:
+        Tuple of (master_df, credit_history_df)
+    """
+    # Temporarily override data_dir if using evaluation set
+    original_data_dir = config["paths"].get("data_dir")
+    if use_evaluation and "evaluation_dir" in config["paths"]:
+        config["paths"]["data_dir"] = config["paths"]["evaluation_dir"]
+    
+    try:
+        id_col = config.get("merging", {}).get("id_col", "customer_ref")
+        application = _load_source(_resolve_source_path(config, "application"))
+        if application.empty:
+            raise RuntimeError("Application dataset is required and could not be loaded")
+        application = _standardize_customer_id(application, id_col)
+        application = _ensure_application_date(application, config)
+        demographics = _load_source(_resolve_source_path(config, "demographics"))
+        if not demographics.empty:
+            demographics = _standardize_customer_id(demographics, id_col)
+            demographics = _auto_cast_numeric(demographics, exclude=[id_col])
+        loan_details = _load_source(_resolve_source_path(config, "loan_details"))
+        if not loan_details.empty:
+            loan_details = _standardize_customer_id(loan_details, id_col)
+            loan_details = _auto_cast_numeric(loan_details, exclude=[id_col])
+        financial = _load_source(_resolve_source_path(config, "financial_ratios"))
+        if not financial.empty:
+            financial = _standardize_customer_id(financial, id_col)
+            financial = _auto_cast_numeric(financial, exclude=[id_col])
+        credit_history = _load_source(_resolve_source_path(config, "credit_history"))
+        if not credit_history.empty:
+            credit_history = _standardize_customer_id(credit_history, id_col)
+            credit_history = _auto_cast_numeric(credit_history, exclude=[id_col, config.get("merging", {}).get("credit_history_date_col")])
 
-    master = application.copy()
-    if not demographics.empty:
-        master = master.merge(demographics, on=id_col, how="left", suffixes=("", "_demo"))
-    if not loan_details.empty:
-        master = master.merge(loan_details, on=id_col, how="left", suffixes=("", "_loan"))
-    if not financial.empty:
-        master = master.merge(financial, on=id_col, how="left", suffixes=("", "_fin"))
-    return master, credit_history
+        master = application.copy()
+        if not demographics.empty:
+            master = master.merge(demographics, on=id_col, how="left", suffixes=("", "_demo"))
+        if not loan_details.empty:
+            master = master.merge(loan_details, on=id_col, how="left", suffixes=("", "_loan"))
+        if not financial.empty:
+            master = master.merge(financial, on=id_col, how="left", suffixes=("", "_fin"))
+        return master, credit_history
+    finally:
+        # Restore original data_dir
+        if use_evaluation and original_data_dir:
+            config["paths"]["data_dir"] = original_data_dir
 
 
 def _read_bytes(path: Path, n_bytes: int = 200_000) -> bytes:
