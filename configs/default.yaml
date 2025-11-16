@@ -64,12 +64,16 @@ feature_engineering:
     loan_to_income: ["loan_amount", "annual_income"]
     payment_to_income: ["monthly_payment", "annual_income"]
     behavior_dti: ["total_monthly_debt_payment", "monthly_income"]
+    expense_to_income: ["existing_monthly_debt", "monthly_income"]
+    cash_flow_margin: ["monthly_free_cash_flow", "monthly_income"]
+    payment_vs_cash_flow: ["monthly_payment", "monthly_free_cash_flow"]
+    revolving_limit_utilization: ["revolving_balance", "total_credit_limit_mean_hist"]
   numeric_aggregations:
     monthly_payment: ["mean", "max", "std"]
     loan_amount: ["mean", "max"]
     credit_utilization: ["mean", "max"]
-  rolling_windows: [3, 6, 12]
-  trend_features: ["credit_utilization", "monthly_payment", "loan_amount"]
+  rolling_windows: [3, 6, 12, 18]
+  trend_features: ["credit_utilization", "monthly_payment", "loan_amount", "monthly_income", "revolving_balance"]
   delinquency_markers: ["dpd_30_flag", "dpd_60_flag", "dpd_90_flag"]
   log_features:
     - loan_amount
@@ -77,10 +81,17 @@ feature_engineering:
     - annual_income
     - total_debt_amount
     - credit_usage_amount
+    - monthly_payment
+    - monthly_free_cash_flow
   winsorize:
     loan_amount: [0.01, 0.99]
     monthly_income: [0.01, 0.99]
     annual_income: [0.01, 0.99]
+    total_debt_amount: [0.01, 0.99]
+    credit_usage_amount: [0.01, 0.99]
+    monthly_payment: [0.01, 0.99]
+    monthly_free_cash_flow: [0.01, 0.99]
+    total_monthly_debt_payment: [0.01, 0.99]
   event_markers:
     high_utilization:
       column: "credit_utilization"
@@ -97,27 +108,47 @@ feature_engineering:
       column: "has_mobile_app"
       threshold: 1
       operator: "=="
+    high_dti:
+      column: "debt_to_income_ratio"
+      threshold: 60
+      operator: ">="
+    tight_cash_flow:
+      column: "monthly_free_cash_flow"
+      threshold: 0
+      operator: "<="
   segment_normalization:
     monthly_income: "employment_type"
-  volatility_features: ["monthly_payment", "credit_utilization"]
-  time_since_event_cols: ["dpd_30_flag", "dpd_60_flag"]
+    loan_amount: "employment_type"
+  volatility_features: ["monthly_payment", "credit_utilization", "revolving_balance"]
+  time_since_event_cols: ["dpd_30_flag", "dpd_60_flag", "dpd_90_flag"]
   active_loan_indicator: "account_status_code"
+  interaction_pairs:
+    - ["debt_to_income_ratio", "credit_utilization"]
+    - ["loan_amount", "monthly_income"]
+    - ["monthly_payment", "monthly_income"]
+    - ["loan_amount", "interest_rate"]
+    - ["payment_to_income_ratio", "credit_utilization"]
 modeling:
-  cv_folds: 2
+  cv_folds: 3
   logistic:
     bins: 5
     woe_features: []
   lightgbm:
-    n_estimators: 600
+    n_estimators: 1200
     learning_rate: 0.05
     max_depth: -1
     subsample: 0.85
     colsample: 0.9
     tuning:
       enabled: true
-      n_trials: 4
-      learning_rate: [0.02, 0.08]
-      num_leaves: [32, 128]
+      n_trials: 10
+      learning_rate: [0.01, 0.08]
+      num_leaves: [32, 192]
+      min_child_samples: [50, 500]
+      subsample: [0.7, 1.0]
+      colsample: [0.6, 1.0]
+      reg_lambda: [0.0, 50.0]
+      reg_alpha: [0.0, 20.0]
     suspicious:
       auc: 0.99
       ks: 0.99
@@ -128,13 +159,13 @@ modeling:
       sample_size: 20000
       auc_threshold: 0.62
   catboost:
-    iterations: 400
+    iterations: 1200
     learning_rate: 0.03
     depth: 6
     l2_leaf_reg: 6.0
     tuning:
-      enabled: false
-      n_trials: 6
+      enabled: true
+      n_trials: 8
       depth: [4, 8]
       learning_rate: [0.02, 0.08]
       l2_leaf_reg: [2.0, 10.0]
@@ -147,11 +178,15 @@ modeling:
       enabled: true
       sample_size: 20000
       auc_threshold: 0.62
+  ensemble:
+    enabled: true
+    n_trials: 150
+    min_weight: 0.05
 feature_selection:
   suspicious_auc: 0.98
   weak_auc_tolerance: 0.02
   low_variance_ratio: 0.001
-  drop_weak: true
+  drop_weak: false
   mutual_info_sample: 20000
   report_top_k: 20
 calibration:

@@ -100,16 +100,18 @@ class WOETransformer(BaseEstimator, TransformerMixin):
 
     def transform(self, X: pd.DataFrame):  # type: ignore[override]
         binned = self.binner.transform(X)
-        out = pd.DataFrame(index=X.index)
+        encoded_cols: List[pd.Series] = []
         for col, mapping in self.woe_mappings_.items():
             if col not in binned.columns:
-                out[col] = 0.0
+                encoded_cols.append(pd.Series(0.0, index=X.index, name=col))
                 continue
             series = binned[col].astype(object)
             encoded = series.map(mapping)
-            encoded = pd.to_numeric(encoded, errors="coerce").fillna(0.0)
-            out[col] = encoded.astype(float)
-        return out
+            encoded = pd.to_numeric(encoded, errors="coerce").fillna(0.0).astype(float)
+            encoded_cols.append(encoded.rename(col))
+        if not encoded_cols:
+            return pd.DataFrame(index=X.index)
+        return pd.concat(encoded_cols, axis=1)
 
     def get_bin_summaries(self) -> List[BinSummary]:
         summaries: List[BinSummary] = []

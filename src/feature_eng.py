@@ -48,6 +48,7 @@ class FeatureSpec:
     active_loan_indicator: Optional[str] = None
     log_features: List[str] = field(default_factory=list)
     winsorize: Dict[str, List[float]] = field(default_factory=dict)
+    interaction_pairs: List[List[str]] = field(default_factory=list)
 
 
 DEFAULT_SPEC = FeatureSpec(
@@ -117,6 +118,7 @@ def spec_from_config(cfg: Optional[dict]) -> FeatureSpec:
     active_loan_indicator=cfg.get("active_loan_indicator", DEFAULT_SPEC.active_loan_indicator),
     log_features=cfg.get("log_features", DEFAULT_SPEC.log_features),
     winsorize=cfg.get("winsorize", DEFAULT_SPEC.winsorize),
+    interaction_pairs=cfg.get("interaction_pairs", DEFAULT_SPEC.interaction_pairs),
 )
 
 
@@ -295,13 +297,33 @@ def build_winsorized(df: pd.DataFrame, spec: FeatureSpec) -> pd.DataFrame:
     for col, limits in spec.winsorize.items():
         if col not in df.columns:
             continue
-        numeric = pd.to_numeric(df[col], errors="coerce")
+        numeric = pd.to_numeric(df[col], errors="coerce").astype(float)
         if numeric.dropna().empty:
             continue
         lower_q, upper_q = (limits + [0.01, 0.99])[:2] if isinstance(limits, list) else (0.01, 0.99)
         lower = numeric.quantile(lower_q)
         upper = numeric.quantile(upper_q)
-        out[f"{col}_winsor"] = numeric.clip(lower, upper)
+        clipped = numeric.clip(lower, upper)
+        out[f"{col}_winsor"] = clipped.astype(float)
+    return out
+
+
+def build_interactions(df: pd.DataFrame, spec: FeatureSpec) -> pd.DataFrame:
+    pairs = spec.interaction_pairs
+    if not pairs:
+        return pd.DataFrame(index=df.index)
+    out = pd.DataFrame(index=df.index)
+    for pair in pairs:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            continue
+        left, right = pair
+        if left not in df.columns or right not in df.columns:
+            continue
+        left_series = pd.to_numeric(df[left], errors="coerce")
+        right_series = pd.to_numeric(df[right], errors="coerce")
+        out[f"{left}_x_{right}"] = left_series * right_series
+        out[f"{left}_minus_{right}"] = left_series - right_series
+        out[f"{left}_div_{right}"] = _safe_ratio(left_series, right_series)
     return out
 
 
@@ -393,6 +415,7 @@ def build_features(
     macro_df = build_macro_time_features(df)
     log_df = build_log_features(df, spec)
     winsor_df = build_winsorized(df, spec)
+    interaction_df = build_interactions(df, spec)
     features = pd.concat(
         [
             ratio_df,
@@ -409,6 +432,7 @@ def build_features(
             macro_df,
             log_df,
             winsor_df,
+            interaction_df,
         ],
         axis=1,
     )

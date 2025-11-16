@@ -94,6 +94,13 @@ class TrainedModel:
             woe = self.extras["woe"]
             transformed = woe.transform(df[self.feature_cols])
             return self.estimator.predict_proba(transformed)[:, 1]
+        if self.name == "ensemble" and "base_models" in self.extras:
+            preds = np.zeros(len(df), dtype=float)
+            weights = self.extras.get("weights", [])
+            base_models = self.extras.get("base_models", [])
+            for weight, model in zip(weights, base_models):
+                preds += weight * model.predict_proba(df)
+            return preds
         return self.estimator.predict_proba(df[self.feature_cols])[:, 1]
 
 
@@ -369,6 +376,74 @@ def train_lgbm(
     )
 
 
+def train_weighted_ensemble(
+    models: List[Optional[TrainedModel]],
+    train: pd.DataFrame,
+    valid: pd.DataFrame,
+    target: str,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> Optional[TrainedModel]:
+    if not cfg or not cfg.get("enabled", True):
+        return None
+    available: List[TrainedModel] = [m for m in models if m is not None]
+    if len(available) < 2:
+        return None
+    y_valid = valid[target].values
+    y_train = train[target].values
+    valid_matrix = np.column_stack([m.predict_proba(valid) for m in available])
+    train_matrix = np.column_stack([m.predict_proba(train) for m in available])
+    if valid_matrix.ndim != 2 or valid_matrix.shape[1] < 2:
+        return None
+    rng = np.random.default_rng(int(cfg.get("seed", 42)))
+    n_trials = int(cfg.get("n_trials", 64))
+    min_weight = float(cfg.get("min_weight", 0.0))
+    candidates: List[np.ndarray] = []
+    n_models = valid_matrix.shape[1]
+    candidates.append(np.full(n_models, 1.0 / n_models))
+    for idx in range(n_models):
+        one_hot = np.zeros(n_models)
+        one_hot[idx] = 1.0
+        candidates.append(one_hot)
+    for _ in range(max(n_trials, 1)):
+        weights = rng.dirichlet(np.ones(n_models))
+        if min_weight > 0.0:
+            weights = np.clip(weights, min_weight, None)
+            weights = weights / weights.sum()
+        candidates.append(weights)
+    best_auc = -math.inf
+    best_weights = candidates[0]
+    best_valid = valid_matrix @ best_weights
+    for weights in candidates:
+        combined = valid_matrix @ weights
+        auc = roc_auc_score(y_valid, combined)
+        if auc > best_auc:
+            best_auc = auc
+            best_weights = weights
+            best_valid = combined
+    valid_metrics = report_to_dict(compute_metrics(y_valid, best_valid))
+    train_pred = train_matrix @ best_weights
+    train_metrics = report_to_dict(compute_metrics(y_train, train_pred))
+    valid_metrics["train_roc_auc"] = train_metrics.get("roc_auc")
+    suspicious = any(m.extras.get("is_suspicious") for m in available if isinstance(m.extras, dict))
+    extras = {
+        "base_models": available,
+        "weights": best_weights,
+        "is_suspicious": suspicious,
+    }
+    LOGGER.info(
+        "Ensemble weights %s produced valid ROC-AUC %.4f",
+        np.round(best_weights, 3).tolist(),
+        valid_metrics["roc_auc"],
+    )
+    return TrainedModel(
+        name="ensemble",
+        estimator=None,
+        metrics=valid_metrics,
+        feature_cols=[],
+        extras=extras,
+    )
+
+
 def train_catboost(
     train: pd.DataFrame,
     valid: pd.DataFrame,
@@ -490,4 +565,5 @@ __all__ = [
     "train_catboost",
     "train_lgbm",
     "train_logistic_woe",
+    "train_weighted_ensemble",
 ]

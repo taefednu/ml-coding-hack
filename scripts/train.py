@@ -38,6 +38,7 @@ from src.modeling import (  # noqa: E402
     train_catboost,
     train_lgbm,
     train_logistic_woe,
+    train_weighted_ensemble,
 )
 from src.scorecard import ScorecardConfig, export_scorecard, pd_to_score  # noqa: E402
 from src.utils import ArtifactPaths, get_logger, load_config, save_json, seed_everything  # noqa: E402
@@ -163,7 +164,14 @@ def _run_feature_diagnostics(
         auc_train = _single_feature_auc(train_series, y_train)
         auc_valid = _single_feature_auc(valid_df[col], y_valid) if y_valid is not None and col in valid_df.columns else None
         encoded = _encode_feature(train_series)
-        corr = float(encoded.corr(y_train)) if encoded.notna().sum() > 1 else 0.0
+        corr = 0.0
+        encoded_std = float(encoded.std(skipna=True)) if encoded.notna().sum() > 1 else 0.0
+        target_std = float(y_train.std()) if y_train.notna().sum() > 1 else 0.0
+        if encoded_std > 0 and target_std > 0:
+            try:
+                corr = float(encoded.corr(y_train))
+            except Exception:
+                corr = 0.0
         unique_ratio = train_series.nunique(dropna=True) / max(len(train_series), 1)
         stats.append(
             {
@@ -304,26 +312,42 @@ def train_pipeline(config: Dict[str, any]) -> None:
         client_id if client_id and client_id in train_df.columns else None,
         config["modeling"].get("cv_folds", 1),
     )
-    challengers = [m for m in [cat_model, lgbm_model] if m is not None]
-    challenger = max(challengers, key=lambda m: m.metrics.get("roc_auc", 0.0)) if challengers else None
+    ensemble_model = train_weighted_ensemble(
+        [champion, cat_model, lgbm_model],
+        train_df,
+        valid_df,
+        target_col,
+        config["modeling"].get("ensemble", {}),
+    )
+    challengers = [m for m in [cat_model, lgbm_model, ensemble_model] if m is not None]
+    tree_challengers = [m for m in [cat_model, lgbm_model] if m is not None]
+    challenger = max(tree_challengers, key=lambda m: m.metrics.get("roc_auc", 0.0)) if tree_challengers else None
     production_model = champion
-    if challenger:
-        challenger_auc = challenger.metrics.get("roc_auc", 0.0)
-        champion_auc = champion.metrics.get("roc_auc", 0.0)
-        if challenger.extras.get("is_suspicious"):
-            LOGGER.warning("Challenger %s flagged as suspicious; keeping champion", challenger.name)
-        elif challenger_auc >= 0.99:
-            LOGGER.warning("Challenger %s achieved suspicious ROC-AUC=%.4f; keeping champion to avoid leakage", challenger.name, challenger_auc)
-        elif challenger_auc > champion_auc + 0.005:
-            production_model = challenger
+    current_auc = champion.metrics.get("roc_auc", 0.0)
+    for candidate in challengers:
+        cand_auc = candidate.metrics.get("roc_auc", 0.0)
+        suspicious_flag = candidate.extras.get("is_suspicious") if isinstance(candidate.extras, dict) else False
+        if suspicious_flag:
+            LOGGER.warning("Candidate %s flagged as suspicious; skipping", candidate.name)
+            continue
+        if cand_auc >= 0.99:
+            LOGGER.warning("Candidate %s achieved suspicious ROC-AUC=%.4f; skipping to avoid leakage", candidate.name, cand_auc)
+            continue
+        if cand_auc > current_auc + 0.005:
+            LOGGER.info("Candidate %s outperformed current production (%.4f vs %.4f)", candidate.name, cand_auc, current_auc)
+            production_model = candidate
+            current_auc = cand_auc
         else:
-            LOGGER.info("Challenger %s did not outperform champion (%.4f vs %.4f)", challenger.name, challenger_auc, champion_auc)
+            LOGGER.info("Candidate %s did not outperform production (%.4f vs %.4f)", candidate.name, cand_auc, current_auc)
 
     champion_path = paths.models_dir / "champion_model.pkl"
     champion.save(champion_path)
     if challenger:
         challenger_path = paths.models_dir / "challenger_model.pkl"
         challenger.save(challenger_path)
+    if ensemble_model:
+        ensemble_path = paths.models_dir / "ensemble_model.pkl"
+        ensemble_model.save(ensemble_path)
     production_path = paths.models_dir / "best_model.pkl"
     production_model.save(production_path)
     LOGGER.info("Production model: %s", production_model.name)
@@ -352,6 +376,7 @@ def train_pipeline(config: Dict[str, any]) -> None:
     metrics_payload = {
         "champion": champion.metrics,
         "challenger": challenger.metrics if challenger else None,
+        "ensemble": ensemble_model.metrics if ensemble_model else None,
         "calibration": calibrator_metrics,
         "valid": report_to_dict(compute_metrics(valid_df[target_col].values, valid_proba.values)),
         "oot": report_to_dict(compute_metrics(oot_df[target_col].values, oot_proba.values)),
