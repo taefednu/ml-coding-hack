@@ -46,14 +46,6 @@ test_final_results.log
 *.bak
 *.cache
 
-# Data files (большие датасеты)
-data_sets/*.csv
-data_sets/*.jsonl
-data_sets/*.xml
-test_data/*.csv
-test_data/*.parquet
-test_data/*.jsonl
-test_data/*.xml
 
 # Models (большие файлы моделей)
 models/*.pkl
@@ -61,8 +53,7 @@ models/*.joblib
 models/*.h5
 models/*.pth
 
-# Test outputs
-test_data/predictions.csv
+
 
 # Plots (можно пересоздать)
 plots/*.png
