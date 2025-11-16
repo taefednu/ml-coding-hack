@@ -1,6 +1,7 @@
 seed: 211
 paths:
-  data_dir: data/ml_coding_hackathon
+  data_dir: data/train  # Training data directory
+  evaluation_dir: data/evaluation_set  # Evaluation/test data directory
   artifacts_dir: artifacts
   models_dir: models
   reports_dir: artifacts/reports
@@ -58,6 +59,7 @@ merging:
   dpd_thresholds: [30, 60, 90]
 feature_engineering:
   advanced_behavioral_features: true
+  enable_default_detection: true
   interactions:
     enabled: true
     top_k: 12
@@ -198,6 +200,11 @@ modeling:
     enabled: true
     n_trials: 150
     min_weight: 0.05
+    optimize_metric: "roc_auc"  # "roc_auc", "pr_auc", "f1"
+  stacking:
+    enabled: true
+    n_folds: 5
+    threshold_metric: "f1"  # "f1", "f2", or "default"
   xgboost:
     n_estimators: 1500
     learning_rate: 0.05

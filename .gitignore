@@ -15,7 +15,7 @@ env/
 .vscode/
 
 # Data & artifacts
-data/ml_coding_hackathon/
+data/
 artifacts/
 catboost_info/
 models/

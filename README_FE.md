@@ -25,7 +25,7 @@ remaining fully reproducible and notebook-friendly.
   `preprocess_and_generate_features` which wires ID normalisation, merging,
   feature engineering and preprocessing together.
 - `scripts/build_master_table.py` ― CLI to read raw files from
-  `data/ml_coding_hackathon`, run the full pipeline and persist the final
+  `data/train` (default) or specified directory, run the full pipeline and persist the final
   modelling dataset (CSV or Parquet).
 
 ## Usage
@@ -70,6 +70,9 @@ class weights for imbalanced training and the untransformed master table.
   indicators for fraud/risk control.
 - **Segment normalisation:** Income vs. regional mean ratios for peer-relative
   stability.
+- **Advanced Behavioral Features:** DPD counters (3/6/12 months), load trends (DTI/debt_service_ratio slopes), volatility (std/coefficient of variation), stress indicators (proportion of months with DPD > 0).
+- **Default Detection Features:** Specialized features for default detection — risk combinations (extreme_risk_combo, critical_risk_combo), feature interactions (credit_history × debt_stress, utilization × debt), risk scoring (default_risk_score 0-10), behavioral flags (late_night_application, support_intensive_low_engagement), triple interactions (young + unstable + high debt).
+- **Smart Interactions:** Automatic generation of interactions between top-K features (product, ratio, difference) filtered by Spearman correlation from `feature_strength.json`.
 - **WOE/IV bundle:** Optional monotonic WOE features plus IV/correlation/MI
   ranking utilities for Champion scorecards.
 
@@ -85,7 +88,7 @@ class weights for imbalanced training and the untransformed master table.
 
 ```
 python scripts/build_master_table.py \
-    --data-dir data/ml_coding_hackathon \
+    --data-dir data/train \
     --output artifacts/master_table.parquet \
     --categorical-encoding frequency \
     --enable-woe
