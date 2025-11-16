@@ -471,6 +471,180 @@ def build_credit_history_features(
             window_df_final.index.name = app_col
             window_df_final = window_df_final.reset_index()
             result = result.merge(window_df_final, on=app_col, how="left")
+    
+    # Advanced behavioral features if enabled
+    feat_cfg = config.get("feature_engineering", {})
+    if feat_cfg.get("advanced_behavioral_features", False) and not dated.empty:
+        advanced_features = _build_advanced_behavioral_features(
+            dated, app_col, date_col, dpd_cols, payment_cols, debt_cols, 
+            util_numerators, util_denominators
+        )
+        if not advanced_features.empty:
+            result = result.merge(advanced_features, on=app_col, how="left")
+    
+    return result
+
+
+def _build_advanced_behavioral_features(
+    dated: pd.DataFrame,
+    app_col: str,
+    date_col: str,
+    dpd_cols: List[str],
+    payment_cols: List[str],
+    debt_cols: List[str],
+    util_numerators: List[str],
+    util_denominators: List[str],
+) -> pd.DataFrame:
+    """Build advanced behavioral features: DPD counters, trends, volatility, stress indicators."""
+    unique_apps = dated[app_col].unique()
+    result = pd.DataFrame({app_col: unique_apps})
+    
+    windows = [3, 6, 12]
+    
+    for window in windows:
+        lower = dated["__application_date"] - pd.DateOffset(months=window)
+        mask = dated[date_col] >= lower
+        window_df = dated.loc[mask].copy().sort_values([app_col, date_col])
+        
+        if window_df.empty:
+            continue
+        
+        group = window_df.groupby(app_col, dropna=False)
+        advanced: Dict[str, pd.Series] = {}
+        
+        # DPD counters
+        if dpd_cols:
+            dpd_values = pd.to_numeric(window_df[dpd_cols], errors="coerce").max(axis=1).fillna(0)
+            
+            # Count months with DPD > 0, >= 30, >= 60
+            advanced[f"beh_dpd_cnt_gt0_{window}m"] = (dpd_values > 0).groupby(window_df[app_col]).sum()
+            advanced[f"beh_dpd_cnt_ge30_{window}m"] = (dpd_values >= 30).groupby(window_df[app_col]).sum()
+            advanced[f"beh_dpd_cnt_ge60_{window}m"] = (dpd_values >= 60).groupby(window_df[app_col]).sum()
+            
+            # Maximum DPD
+            advanced[f"beh_dpd_max_{window}m"] = dpd_values.groupby(window_df[app_col]).max()
+            
+            # Stress indicators: proportion of months with DPD > 0
+            month_counts = group.size()
+            dpd_months = (dpd_values > 0).groupby(window_df[app_col]).sum()
+            advanced[f"beh_dpd_rate_{window}m"] = (dpd_months / month_counts).fillna(0.0)
+            
+            # Recovery episodes: transitions from DPD>0 to DPD=0
+            if window >= 12:
+                def _count_recoveries(group_df: pd.DataFrame) -> int:
+                    dpd_series = pd.to_numeric(group_df[dpd_cols].max(axis=1), errors="coerce").fillna(0)
+                    was_dpd = (dpd_series > 0).astype(int)
+                    # Shift to detect transitions: 1 -> 0 means recovery
+                    shifted = was_dpd.shift(1).fillna(0)
+                    recoveries = ((was_dpd == 0) & (shifted == 1)).sum()
+                    return int(recoveries)
+                
+                advanced[f"beh_recovery_episodes_{window}m"] = group.apply(_count_recoveries)
+        
+        # Trends: linear slope for DTI/debt_service_ratio and utilization
+        if debt_cols and payment_cols and window >= 6:
+            balance = pd.to_numeric(window_df[debt_cols[0]], errors="coerce")
+            payment = pd.to_numeric(window_df[payment_cols[0]], errors="coerce").replace(0, np.nan)
+            
+            if balance.notna().any() and payment.notna().any():
+                def _calculate_slope(group_df: pd.DataFrame, col: str) -> float:
+                    series = group_df.sort_values(date_col)[col].dropna()
+                    if len(series) < 2:
+                        return 0.0
+                    x = np.arange(len(series))
+                    slope = np.polyfit(x, series.values, 1)[0] if len(series) > 1 else 0.0
+                    return float(slope)
+                
+                balance_slope = window_df.assign(_balance=balance).dropna(subset=["_balance"]).groupby(app_col, dropna=False).apply(
+                    lambda g: _calculate_slope(g, "_balance"), include_groups=False
+                )
+                advanced[f"beh_balance_slope_{window}m"] = balance_slope
+                
+                if window >= 12:
+                    payment_slope = window_df.assign(_payment=payment).dropna(subset=["_payment"]).groupby(app_col, dropna=False).apply(
+                        lambda g: _calculate_slope(g, "_payment"), include_groups=False
+                    )
+                    advanced[f"beh_payment_slope_{window}m"] = payment_slope
+        
+        # Utilization trends
+        if util_numerators and util_denominators and window >= 6:
+            num = pd.to_numeric(window_df[util_numerators[0]], errors="coerce")
+            den = pd.to_numeric(window_df[util_denominators[0]], errors="coerce").replace(0, np.nan)
+            util_ratio = (num / den).fillna(0.0)
+            
+            def _calculate_slope_util(group_df: pd.DataFrame) -> float:
+                series = group_df.sort_values(date_col)["_util"].dropna()
+                if len(series) < 2:
+                    return 0.0
+                x = np.arange(len(series))
+                slope = np.polyfit(x, series.values, 1)[0] if len(series) > 1 else 0.0
+                return float(slope)
+            
+            util_slope = window_df.assign(_util=util_ratio).dropna(subset=["_util"]).groupby(app_col, dropna=False).apply(
+                _calculate_slope_util, include_groups=False
+            )
+            advanced[f"beh_util_slope_{window}m"] = util_slope
+        
+        # Deltas: last_value - mean_value
+        if debt_cols:
+            balance = pd.to_numeric(window_df[debt_cols[0]], errors="coerce")
+            balance_mean = balance.groupby(window_df[app_col]).mean()
+            balance_last = window_df.assign(_balance=balance).dropna(subset=["_balance"]).groupby(app_col, dropna=False).apply(
+                lambda g: g.sort_values(date_col)["_balance"].iloc[-1], include_groups=False
+            )
+            advanced[f"beh_balance_delta_{window}m"] = balance_last - balance_mean
+        
+        if payment_cols:
+            payment = pd.to_numeric(window_df[payment_cols[0]], errors="coerce")
+            payment_mean = payment.groupby(window_df[app_col]).mean()
+            payment_last = window_df.assign(_payment=payment).dropna(subset=["_payment"]).groupby(app_col, dropna=False).apply(
+                lambda g: g.sort_values(date_col)["_payment"].iloc[-1], include_groups=False
+            )
+            advanced[f"beh_payment_delta_{window}m"] = payment_last - payment_mean
+        
+        # Volatility: std and coefficient of variation
+        if payment_cols:
+            payment = pd.to_numeric(window_df[payment_cols[0]], errors="coerce")
+            payment_std = payment.groupby(window_df[app_col]).std(ddof=0).fillna(0.0)
+            payment_mean = payment.groupby(window_df[app_col]).mean().replace(0, np.nan)
+            advanced[f"beh_payment_std_{window}m"] = payment_std
+            advanced[f"beh_payment_cv_{window}m"] = (payment_std / payment_mean).fillna(0.0)
+        
+        if debt_cols:
+            balance = pd.to_numeric(window_df[debt_cols[0]], errors="coerce")
+            balance_std = balance.groupby(window_df[app_col]).std(ddof=0).fillna(0.0)
+            balance_mean = balance.groupby(window_df[app_col]).mean().replace(0, np.nan)
+            advanced[f"beh_balance_std_{window}m"] = balance_std
+            advanced[f"beh_balance_cv_{window}m"] = (balance_std / balance_mean).fillna(0.0)
+        
+        if util_numerators and util_denominators:
+            num = pd.to_numeric(window_df[util_numerators[0]], errors="coerce")
+            den = pd.to_numeric(window_df[util_denominators[0]], errors="coerce").replace(0, np.nan)
+            util_ratio = (num / den).fillna(0.0)
+            util_std = util_ratio.groupby(window_df[app_col]).std(ddof=0).fillna(0.0)
+            util_mean = util_ratio.groupby(window_df[app_col]).mean().replace(0, np.nan)
+            advanced[f"beh_util_std_{window}m"] = util_std
+            advanced[f"beh_util_cv_{window}m"] = (util_std / util_mean).fillna(0.0)
+        
+        # Stress: proportion of months with payment < minimum (if available)
+        if payment_cols:
+            payment = pd.to_numeric(window_df[payment_cols[0]], errors="coerce")
+            # Look for minimum payment column
+            min_payment_cols = [col for col in window_df.columns if "min" in col.lower() and "payment" in col.lower()]
+            if min_payment_cols:
+                min_payment = pd.to_numeric(window_df[min_payment_cols[0]], errors="coerce")
+                underpaid = (payment < min_payment).fillna(False)
+                month_counts = group.size()
+                underpaid_months = underpaid.groupby(window_df[app_col]).sum()
+                advanced[f"beh_underpayment_rate_{window}m"] = (underpaid_months / month_counts).fillna(0.0)
+        
+        # Merge advanced features
+        if advanced:
+            advanced_df = pd.DataFrame(advanced)
+            advanced_df.index.name = app_col
+            advanced_df = advanced_df.reset_index()
+            result = result.merge(advanced_df, on=app_col, how="left")
+    
     return result
 
 

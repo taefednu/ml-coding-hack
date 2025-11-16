@@ -26,14 +26,14 @@ target:
 preprocessing:
   categorical_encoder: frequency
   target_encoding:
-    smoothing: 5.0
+    smoothing: 20.0
   advanced:
     target_col: "default"
     id_col: "customer_ref"
-    winsor_limits: [0.01, 0.99]
-    log_skew_threshold: 1.0
-    rare_category_threshold: 0.01
-    categorical_encoding: frequency
+    winsor_limits: [0.005, 0.995]
+    log_skew_threshold: 0.8
+    rare_category_threshold: 0.005
+    categorical_encoding: target
     enable_woe: true
     woe_features:
       - loan_amount
@@ -57,6 +57,12 @@ merging:
   credit_history_date_col: "statement_date"
   dpd_thresholds: [30, 60, 90]
 feature_engineering:
+  advanced_behavioral_features: true
+  interactions:
+    enabled: true
+    top_k: 12
+    max_pairs: 20
+    min_spearman_correlation: 0.05
   ratios:
     dti: ["total_debt_amount", "monthly_income"]
     utilization: ["credit_usage_amount", "available_credit"]
@@ -134,14 +140,18 @@ modeling:
     bins: 5
     woe_features: []
   lightgbm:
-    n_estimators: 1200
+    n_estimators: 1500
     learning_rate: 0.05
     max_depth: -1
     subsample: 0.85
     colsample: 0.9
+    optimize_class_weight: true
+    monotone_constraints:
+      all_numeric: increasing
     tuning:
       enabled: true
-      n_trials: 10
+      use_optuna: true
+      n_trials: 75
       learning_rate: [0.01, 0.08]
       num_leaves: [32, 192]
       min_child_samples: [50, 500]
@@ -159,16 +169,22 @@ modeling:
       sample_size: 20000
       auc_threshold: 0.62
   catboost:
-    iterations: 1200
-    learning_rate: 0.03
+    iterations: 1500
+    learning_rate: 0.05
     depth: 6
-    l2_leaf_reg: 6.0
+    l2_leaf_reg: 3.0
+    optimize_class_weight: true
+    monotone_constraints:
+      all_numeric: increasing
     tuning:
       enabled: true
-      n_trials: 8
+      use_optuna: true
+      n_trials: 50
       depth: [4, 8]
       learning_rate: [0.02, 0.08]
       l2_leaf_reg: [2.0, 10.0]
+      subsample: [0.7, 1.0]
+      colsample_bylevel: [0.6, 1.0]
     suspicious:
       auc: 0.99
       ks: 0.99
@@ -182,13 +198,33 @@ modeling:
     enabled: true
     n_trials: 150
     min_weight: 0.05
+  xgboost:
+    n_estimators: 1500
+    learning_rate: 0.05
+    max_depth: 6
+    subsample: 0.8
+    colsample: 0.8
+    optimize_class_weight: true
+    monotone_constraints:
+      all_numeric: increasing
+    tuning:
+      enabled: true
+      use_optuna: true
+      n_trials: 50
+  stacking:
+    enabled: true
+    n_folds: 5
 feature_selection:
   suspicious_auc: 0.98
   weak_auc_tolerance: 0.02
   low_variance_ratio: 0.001
   drop_weak: false
+  min_spearman_correlation: 0.05  # Mandatory minimum Spearman correlation
+  drop_weak_spearman: true  # Automatically drop features below threshold
   mutual_info_sample: 20000
   report_top_k: 20
+  use_shap_selection: false
+  shap_top_k: 100
 calibration:
   enabled: true
 scorecard:

@@ -327,6 +327,157 @@ def build_interactions(df: pd.DataFrame, spec: FeatureSpec) -> pd.DataFrame:
     return out
 
 
+def build_smart_interactions(
+    df: pd.DataFrame,
+    feature_strength_path: Optional[str] = None,
+    top_k: int = 12,
+    max_pairs: int = 20,
+    forbidden_ids: Optional[List[str]] = None,
+    suspicious_features: Optional[List[str]] = None,
+    min_spearman_corr: float = 0.01,
+) -> pd.DataFrame:
+    """
+    Build smart interactions between top features from feature_strength.json.
+    
+    MANDATORY: Only uses features with Spearman correlation >= min_spearman_corr.
+    Filters out ID-like columns, suspicious features, and categorical features.
+    Generates product, ratio, and difference interactions for top K features.
+    """
+    import json
+    from pathlib import Path
+    
+    if feature_strength_path and Path(feature_strength_path).exists():
+        try:
+            with open(feature_strength_path, "r") as f:
+                strength_data = json.load(f)
+            
+            # Get top features by Spearman correlation (MANDATORY criterion)
+            # Only use features with sufficient Spearman correlation
+            top_features = []
+            if "top_spearman" in strength_data and strength_data["top_spearman"]:
+                # Filter by minimum Spearman correlation requirement
+                top_features = [
+                    f["feature"] 
+                    for f in strength_data["top_spearman"][:top_k * 2]  # Take more to filter
+                    if abs(f.get("spearman_corr", 0.0)) >= min_spearman_corr
+                ][:top_k]
+            elif "top_auc" in strength_data:
+                # Fallback: check Spearman correlation from full stats if available
+                if "top_spearman" in strength_data:
+                    spearman_dict = {f["feature"]: f.get("spearman_corr", 0.0) 
+                                   for f in strength_data["top_spearman"]}
+                    top_features = [
+                        f["feature"] 
+                        for f in strength_data["top_auc"][:top_k * 2]
+                        if abs(spearman_dict.get(f["feature"], 0.0)) >= min_spearman_corr
+                    ][:top_k]
+                else:
+                    # If no Spearman data, use AUC but log warning
+                    LOGGER.warning("No Spearman correlation data available, using AUC ranking")
+                    top_features = [f["feature"] for f in strength_data["top_auc"][:top_k]]
+            elif "top_mutual_info" in strength_data:
+                # Similar fallback for mutual info
+                LOGGER.warning("Using mutual info ranking without Spearman correlation filter")
+                top_features = [f["feature"] for f in strength_data["top_mutual_info"][:top_k]]
+            
+            if not top_features:
+                LOGGER.warning("No features passed Spearman correlation threshold (>= %.3f)", min_spearman_corr)
+                return pd.DataFrame(index=df.index)
+        except Exception as e:
+            LOGGER.warning("Failed to load feature_strength.json: %s", e)
+            return pd.DataFrame(index=df.index)
+    else:
+        # Fallback: use all numeric features if no feature_strength.json
+        # BUT: Without Spearman correlation data, we cannot enforce the requirement
+        LOGGER.warning("No feature_strength.json available - cannot enforce Spearman correlation requirement")
+        numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+        top_features = [col for col in numeric_cols if col not in (forbidden_ids or [])][:top_k]
+    
+    if not top_features:
+        return pd.DataFrame(index=df.index)
+    
+    # Filter features
+    forbidden_ids = set(forbidden_ids or [])
+    suspicious_features = set(suspicious_features or [])
+    
+    # Remove ID-like, suspicious, and non-numeric features
+    # Also verify Spearman correlation from feature_strength if available
+    filtered_features = []
+    spearman_dict = {}
+    if feature_strength_path and Path(feature_strength_path).exists():
+        try:
+            with open(feature_strength_path, "r") as f:
+                strength_data = json.load(f)
+            if "top_spearman" in strength_data:
+                spearman_dict = {f["feature"]: f.get("spearman_corr", 0.0) 
+                               for f in strength_data["top_spearman"]}
+        except Exception:
+            pass
+    
+    for feat in top_features:
+        if feat not in df.columns:
+            continue
+        if feat.lower() in forbidden_ids or any(id_name in feat.lower() for id_name in ["id", "ref", "code", "num"]):
+            continue
+        if feat in suspicious_features:
+            continue
+        # Only numeric features
+        if df[feat].dtype not in ["int64", "float64", "float32", "int32"]:
+            continue
+        if feat.startswith(("ix_", "ix_beh_")):  # Skip existing interactions
+            continue
+        # MANDATORY: Check Spearman correlation if available
+        if spearman_dict and feat in spearman_dict:
+            if abs(spearman_dict[feat]) < min_spearman_corr:
+                LOGGER.debug("Skipping feature %s: Spearman correlation %.4f < %.4f", 
+                           feat, spearman_dict[feat], min_spearman_corr)
+                continue
+        filtered_features.append(feat)
+    
+    if len(filtered_features) < 2:
+        return pd.DataFrame(index=df.index)
+    
+    # Generate pairs (limit to max_pairs)
+    pairs = []
+    for i in range(len(filtered_features)):
+        for j in range(i + 1, len(filtered_features)):
+            if len(pairs) >= max_pairs:
+                break
+            pairs.append((filtered_features[i], filtered_features[j]))
+        if len(pairs) >= max_pairs:
+            break
+    
+    if not pairs:
+        return pd.DataFrame(index=df.index)
+    
+    # Generate interactions
+    out = pd.DataFrame(index=df.index)
+    
+    for left, right in pairs:
+        left_series = pd.to_numeric(df[left], errors="coerce")
+        right_series = pd.to_numeric(df[right], errors="coerce")
+        
+        # Product
+        out[f"ix_{left}_x_{right}"] = left_series * right_series
+        
+        # Ratios (both directions)
+        out[f"ix_{left}_div_{right}"] = _safe_ratio(left_series, right_series)
+        out[f"ix_{right}_div_{left}"] = _safe_ratio(right_series, left_series)
+        
+        # Differences (both directions)
+        out[f"ix_{left}_minus_{right}"] = left_series - right_series
+        out[f"ix_{right}_minus_{left}"] = right_series - left_series
+    
+    if filtered_features:
+        LOGGER.info("Selected %d features with Spearman correlation >= %.3f for interactions", 
+                   len(filtered_features), min_spearman_corr)
+        LOGGER.info("Generated %d smart interaction features from %d pairs", out.shape[1], len(pairs))
+    else:
+        LOGGER.warning("No features passed Spearman correlation threshold (>= %.3f) for interactions", 
+                      min_spearman_corr)
+    return out
+
+
 def build_volatility(df: pd.DataFrame, spec: FeatureSpec, entity_col: Optional[str]) -> pd.DataFrame:
     if not entity_col or entity_col not in df.columns:
         return pd.DataFrame(index=df.index)
@@ -451,4 +602,5 @@ __all__ = [
     "DEFAULT_SPEC",
     "build_features",
     "spec_from_config",
+    "build_smart_interactions",
 ]

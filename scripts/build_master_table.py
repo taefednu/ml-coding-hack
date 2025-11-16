@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.fe_pipeline import preprocess_and_generate_features
 from src.merging import MergeConfig
 from src.preprocessing import PreprocessingConfig
-from src.utils import get_logger
+from src.utils import get_logger, load_config
 from src.data_loading import _read_xlsx_naive
 
 LOGGER = get_logger(__name__)
@@ -97,6 +97,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Generate monotonic WOE features for champion models.",
     )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/default.yaml"),
+        help="Path to configuration file.",
+    )
     return parser.parse_args()
 
 
@@ -105,7 +111,19 @@ def main() -> None:
     LOGGER.info("Loading raw sources from %s", args.data_dir)
     application, demographics, loan_details, ratios, history = _load_sources(args.data_dir)
 
-    merge_cfg = MergeConfig()
+    # Load config for feature engineering settings
+    config = load_config(args.config) if args.config.exists() else {}
+    feature_engineering_config = config.get("feature_engineering", {})
+    
+    # Build merge config from config file or defaults
+    merging_cfg = config.get("merging", {})
+    merge_cfg = MergeConfig(
+        id_col=merging_cfg.get("id_col", "customer_ref"),
+        application_id_col=merging_cfg.get("application_id_col", "application_id"),
+        credit_history_date_col=merging_cfg.get("credit_history_date_col"),
+        dpd_thresholds=tuple(merging_cfg.get("dpd_thresholds", [30, 60, 90])),
+    )
+    
     prep_cfg = PreprocessingConfig(
         categorical_encoding=args.categorical_encoding,
         enable_woe=args.enable_woe,
@@ -118,6 +136,7 @@ def main() -> None:
         history_df=history,
         merge_config=merge_cfg,
         preprocessing_config=prep_cfg,
+        feature_engineering_config=feature_engineering_config,
         return_artifacts=True,
     )
 

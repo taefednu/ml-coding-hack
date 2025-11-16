@@ -9,6 +9,7 @@ import pandas as pd
 from src.id_normalization import IDNormalizer
 from src.merging import MergeConfig, build_master_table
 from src.preprocessing import AdvancedPreprocessor, PreprocessingConfig
+from src.data_loading import build_credit_history_features
 from src.utils import get_logger
 
 LOGGER = get_logger(__name__)
@@ -32,6 +33,7 @@ def preprocess_and_generate_features(
     history_df: Optional[pd.DataFrame] = None,
     merge_config: Optional[MergeConfig] = None,
     preprocessing_config: Optional[PreprocessingConfig] = None,
+    feature_engineering_config: Optional[Dict] = None,
     return_artifacts: bool = False,
 ) -> Tuple[pd.DataFrame, Optional[PipelineArtifacts]] | pd.DataFrame:
     """Main entry point for notebooks and scripts."""
@@ -54,6 +56,43 @@ def preprocess_and_generate_features(
         history_df=normalized_frames["credit_history"],
         config=merge_cfg,
     )
+    
+    # Add advanced credit history features if enabled
+    feat_cfg = feature_engineering_config or {}
+    if feat_cfg.get("advanced_behavioral_features", False) and not normalized_frames["credit_history"].empty:
+        # Build config dict for build_credit_history_features
+        config_dict = {
+            "merging": {
+                "id_col": merge_cfg.id_col,
+                "credit_history_date_col": merge_cfg.credit_history_date_col or "statement_date",
+                "dpd_thresholds": list(merge_cfg.dpd_thresholds),
+            },
+            "split": {
+                "date_column": merge_cfg.application_datetime_col or "application_date",
+                "application_id_col": merge_cfg.application_id_col,
+            },
+            "target": {
+                "observation_window_months": 12,
+            },
+            "feature_engineering": feat_cfg,
+        }
+        
+        # Add application date column if not present
+        date_col = config_dict["split"]["date_column"]
+        if date_col not in master_table.columns and merge_cfg.application_datetime_col in master_table.columns:
+            master_table[date_col] = master_table[merge_cfg.application_datetime_col]
+        
+        # Build advanced credit history features
+        credit_features = build_credit_history_features(
+            normalized_frames["credit_history"],
+            master_table,
+            config_dict,
+        )
+        if not credit_features.empty:
+            app_col = merge_cfg.application_id_col
+            if app_col in master_table.columns and app_col in credit_features.columns:
+                master_table = master_table.merge(credit_features, on=app_col, how="left")
+                LOGGER.info("Added %d advanced credit history features", len(credit_features.columns) - 1)
     prep_cfg = preprocessing_config or PreprocessingConfig()
     target_col = prep_cfg.target_col
     if target_col not in master_table.columns:
